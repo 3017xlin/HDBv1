@@ -27,9 +27,19 @@ Flow:
 """
 from __future__ import annotations
 
+import os
+
+# Pin BLAS / OpenMP / TBB to a single thread per process BEFORE numpy or
+# any other math library is imported.  We run with Pool(workers=80) so
+# each child must use exactly one thread, otherwise 80 × 80 threads
+# contend and the per-case work appears to hang.
+for _k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+           "NUMEXPR_NUM_THREADS", "TBB_NUM_THREADS",
+           "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_k, "1")
+
 import argparse
 import json
-import os
 import sys
 import time
 from functools import partial
@@ -41,6 +51,8 @@ import numpy as np
 import torch
 import yaml
 from tqdm import tqdm
+
+torch.set_num_threads(1)
 
 # Ensure project root on sys.path so `from preprocess.X import Y`
 # resolves regardless of the project directory name.
@@ -66,6 +78,15 @@ from preprocess.zscore import (
 # ── Physical constants ─────────────────────────────────────────────
 G_GRAVITY = 9.81  # Pa/m  (kinematic pressure detrend coefficient)
 COORD_DIVISOR = 550.0
+
+
+def _pool_worker_init() -> None:
+    """Pin every Pool child to single-threaded math libraries."""
+    for k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+              "NUMEXPR_NUM_THREADS", "TBB_NUM_THREADS",
+              "VECLIB_MAXIMUM_THREADS"):
+        os.environ[k] = "1"
+    torch.set_num_threads(1)
 
 
 # ── Config helpers ─────────────────────────────────────────────────
@@ -103,7 +124,7 @@ def run_anomaly_detection(
 ) -> dict[str, dict]:
     """Scan all physical PTs and return per-case anomaly results."""
     print(f"[Phase 0] Anomaly detection: scanning {len(all_case_paths)} cases ...")
-    with Pool(num_workers) as pool:
+    with Pool(num_workers, initializer=_pool_worker_init) as pool:
         cases_stats = list(
             tqdm(
                 pool.imap(_compute_stats_for_anomaly, all_case_paths),
@@ -349,7 +370,7 @@ def run_zscore_pass(
     """Apply z-score normalisation to all 800 cases using train stats."""
     print(f"[Phase 6] Z-score pass: {len(all_case_names)} cases ...")
     args_list = [(cn, intermediate_dir, norm_stats) for cn in all_case_names]
-    with Pool(num_workers) as pool:
+    with Pool(num_workers, initializer=_pool_worker_init) as pool:
         list(
             tqdm(
                 pool.imap_unordered(_zscore_single_case, args_list),
@@ -406,7 +427,7 @@ def run_precompute_pass(
     # and some operations don't release the GIL well with multiprocessing
     # For large datasets, consider reducing workers to avoid memory pressure
     workers = min(num_workers, 20)  # cap to avoid memory issues
-    with Pool(workers) as pool:
+    with Pool(workers, initializer=_pool_worker_init) as pool:
         list(
             tqdm(
                 pool.imap_unordered(_precompute_single_case, args_list),
@@ -541,7 +562,7 @@ def main():
     )
 
     t0 = time.time()
-    with Pool(num_workers) as pool:
+    with Pool(num_workers, initializer=_pool_worker_init) as pool:
         list(
             tqdm(
                 pool.imap_unordered(process_fn, all_cases),
