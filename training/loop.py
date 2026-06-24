@@ -29,18 +29,18 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim import AdamW
 
-from hdb.dataset.loaders import load_cases_pinned
-from hdb.dataset.prefetcher import AsyncPrefetcher, prepare_one_case, stack_batch
-from hdb.models import HDB3DModel
-from hdb.models.bigbird import build_block_mask_direct
-from hdb.models.idw import gpu_idw
-from hdb.training.checkpoint import save_checkpoint, load_checkpoint
-from hdb.training.curriculum import CurriculumScheduler
-from hdb.training.ddp import init_ddp, cleanup_ddp, is_distributed
-from hdb.training.shard import build_grouped_shard, BATCH_SIZES
-from hdb.training.swa import SWAManager
-from hdb.utils.memory import cpu_rss_gib, gpu_peak_gib
-from hdb.utils.seed import seed_everything, per_case_epoch_seed
+from dataset.loaders import load_cases_pinned
+from dataset.prefetcher import AsyncPrefetcher, prepare_one_case, stack_batch
+from models import HDB3DModel
+from models.bigbird import build_block_mask_direct
+from models.idw import gpu_idw
+from training.checkpoint import save_checkpoint, load_checkpoint
+from training.curriculum import CurriculumScheduler
+from training.ddp import init_ddp, cleanup_ddp, is_distributed
+from training.shard import build_grouped_shard, BATCH_SIZES
+from training.swa import SWAManager
+from utils.memory import cpu_rss_gib, gpu_peak_gib
+from utils.seed import seed_everything, per_case_epoch_seed
 
 SUB_BIN_ORDER = [
     '0-19_easy', '0-19_hard', '20-39_easy', '20-39_hard',
@@ -445,6 +445,10 @@ def train(cfg: dict) -> None:
                 'val_vol_mse': val_metrics['vol_mse'],
                 'val_surf_mse': val_metrics['surf_mse'],
             }
+        elif epoch % 50 == 0:
+            coarse_val = evaluate_split(
+                compiled, val_pt_data, my_val_ids[:3], epoch, device)
+            val_metrics = coarse_val
 
         # ====================================================== LOG
         if rank == 0:
@@ -459,6 +463,18 @@ def train(cfg: dict) -> None:
                     f'steps={n_steps} '
                     f'gpu={gpu_peak_gib(local):.1f}GiB '
                     f'cpu={cpu_rss_gib():.1f}GiB '
+                    f't={time.time() - t_epoch:.1f}s',
+                    flush=True,
+                )
+            elif val_metrics:
+                T_curr = curriculum.temperature(epoch)
+                print(
+                    f'[epoch {epoch:03d} P1] '
+                    f'loss={avg_total:.5f} (vol={avg_vol:.5f} surf={avg_surf:.5f}) '
+                    f'val~={val_metrics["total_mse"]:.5f} (3cases) '
+                    f'lr={sched.get_last_lr()[0]:.3e} T={T_curr:.2f} '
+                    f'steps={n_steps} '
+                    f'gpu={gpu_peak_gib(local):.1f}GiB '
                     f't={time.time() - t_epoch:.1f}s',
                     flush=True,
                 )
@@ -507,7 +523,7 @@ def train(cfg: dict) -> None:
                           indent=2)
             print(f'[done] curve data → {curve_path}', flush=True)
             try:
-                from hdb.evaluation.viz import plot_train_val_curve
+                from evaluation.viz import plot_train_val_curve
                 png = plot_train_val_curve(
                     curve_data, run_dir,
                     swa_start_epoch=curriculum_epochs,

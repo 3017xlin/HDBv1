@@ -104,7 +104,7 @@ def main():
     # ================================================================ MODEL
     banner("STEP 3: Model Instantiation")
     try:
-        from hdb.models import HDB3DModel
+        from models import HDB3DModel
         model = HDB3DModel(cfg).to(device)
 
         total_params = sum(p.numel() for p in model.parameters())
@@ -193,7 +193,7 @@ def main():
     # ================================================================ PREPARE
     banner("STEP 5: prepare_one_case (CPU)")
     try:
-        from hdb.dataset.prefetcher import prepare_one_case, stack_batch
+        from dataset.prefetcher import prepare_one_case, stack_batch
         pt["_case_id"] = 0
 
         n_query = args.n_query
@@ -228,7 +228,7 @@ def main():
     # ================================================================ BIGBIRD
     banner("STEP 6: Build BigBird BlockMask (GPU)")
     try:
-        from hdb.models.bigbird import build_block_mask_direct
+        from models.bigbird import build_block_mask_direct
         R = 16
 
         t0 = time.time()
@@ -267,7 +267,7 @@ def main():
     # ================================================================ IDW
     banner("STEP 8: GPU IDW Computation")
     try:
-        from hdb.models.idw import gpu_idw
+        from models.idw import gpu_idw
         t0 = time.time()
         idw_idx, idw_w = gpu_idw(
             batch["query_pos_norm"],

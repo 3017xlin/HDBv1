@@ -61,7 +61,7 @@ def main() -> None:
 
     # Lazy import to keep startup fast and avoid loading torch before
     # torchrun has set up environment variables.
-    from hdb.training.loop import main as training_main
+    from training.loop import main as training_main
 
     training_main(cfg, resume_path=args.resume)
 
