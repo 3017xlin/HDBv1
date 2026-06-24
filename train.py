@@ -2,7 +2,7 @@
 """Training entry point for HDB 3D urban wind CFD surrogate model.
 
 Usage:
-    torchrun --nproc_per_node=4 hdb/train.py --config hdb/config.yaml [--resume CKPT_PATH]
+    torchrun --nproc_per_node=4 train.py --config config.yaml [--resume CKPT_PATH]
 
 This script parses CLI arguments, loads the YAML config, and delegates to the
 training loop (hdb.training.loop.main). It is intentionally thin so that
@@ -14,6 +14,10 @@ import argparse
 import os
 import sys
 from pathlib import Path
+
+_PROJECT_ROOT = str(Path(__file__).resolve().parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 import yaml
 
