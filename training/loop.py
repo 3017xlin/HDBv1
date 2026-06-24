@@ -277,12 +277,14 @@ def train(cfg: dict) -> None:
         batches = build_grouped_shard(
             sampled_ids, sub_bin_map, epoch, rng_epoch)
 
-        # 3. Prefetcher
+        # 3. Prefetcher (builds BlockMask in background thread)
         prefetcher = AsyncPrefetcher(
             batches, all_pt_data, epoch,
             encoder_k=int(cfg['model'].get('encoder_k', 32)),
             n_query=int(cfg['training'].get('n_query', 125_000)),
             queue_size=int(cfg['training'].get('prefetch_queue_size', 4)),
+            register_tokens=int(cfg['model'].get('register_tokens', 16)),
+            mask_device=device,
         )
 
         epoch_loss_vol = 0.0
@@ -292,12 +294,7 @@ def train(cfg: dict) -> None:
 
         # ====================================================== STEP LOOP
         for batch_cpu in prefetcher:
-            L_current = batch_cpu['L']
-            R = 16
-
-            flex_mask = build_block_mask_direct(
-                batch_cpu['bigbird_key_idx'], L=L_current, R=R,
-                device=device)
+            flex_mask = batch_cpu.pop('flex_mask')
 
             batch = _move_batch_to_gpu(batch_cpu, device)
 

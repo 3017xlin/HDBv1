@@ -19,6 +19,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from hdb.models.bigbird import build_block_mask_direct
 from hdb.training.transient import build_transient1, build_transient2
 from hdb.utils.seed import per_case_epoch_seed
 
@@ -171,13 +172,17 @@ class AsyncPrefetcher:
                  encoder_k: int = 32,
                  n_query: int = 500_000,
                  num_workers: int = 4,
-                 queue_size: int = 4):
+                 queue_size: int = 4,
+                 register_tokens: int = 16,
+                 mask_device: torch.device | str = 'cuda'):
         self.batches = list(batches)
         self.all_pt_data = all_pt_data
         self.epoch = epoch
         self.encoder_k = encoder_k
         self.n_query = n_query
         self.num_workers = num_workers
+        self.register_tokens = register_tokens
+        self.mask_device = mask_device
         self.queue: Queue[dict[str, Any] | None] = Queue(maxsize=queue_size)
         self._stop = threading.Event()
         self._bg = threading.Thread(target=self._run, daemon=True)
@@ -215,6 +220,16 @@ class AsyncPrefetcher:
                 batch['n_query_vol'] = batch_n_qv
                 batch['L'] = L
                 batch['sub_bin'] = sub_bin
+
+                R = self.register_tokens
+                flex_mask = build_block_mask_direct(
+                    batch['bigbird_key_idx'], L=L, R=R,
+                    device=self.mask_device)
+                T = L + R
+                assert flex_mask is not None, (
+                    f"BlockMask construction returned None for L={L}")
+                batch['flex_mask'] = flex_mask
+
                 self.queue.put(batch)
             pool.shutdown(wait=False)
         finally:
