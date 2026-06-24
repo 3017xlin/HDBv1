@@ -99,7 +99,11 @@ def range_from_nbuildings(n: int) -> str:
 
 # ─── worker ────────────────────────────────────────────────────────
 
-def _init_worker() -> None:
+def _init_worker(eps: float = DBSCAN_EPS,
+                 min_samples: int = DBSCAN_MIN_SAMPLES) -> None:
+    global DBSCAN_EPS, DBSCAN_MIN_SAMPLES
+    DBSCAN_EPS = eps
+    DBSCAN_MIN_SAMPLES = min_samples
     for k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
               "NUMEXPR_NUM_THREADS", "TBB_NUM_THREADS"):
         os.environ[k] = "1"
@@ -248,11 +252,6 @@ def main() -> int:
                    help="Skip anomaly filtering (NOT recommended).")
     args = p.parse_args()
 
-    # Propagate DBSCAN params to module globals so workers see them.
-    global DBSCAN_EPS, DBSCAN_MIN_SAMPLES
-    DBSCAN_EPS = args.dbscan_eps
-    DBSCAN_MIN_SAMPLES = args.dbscan_min_samples
-
     with open(args.config) as f:
         cfg = yaml.safe_load(f) or {}
     data_cfg = cfg.get("data", {}) or {}
@@ -281,8 +280,8 @@ def main() -> int:
           f"val={args.n_val} test={args.n_test} "
           f"(total = {args.n_train + args.n_val + args.n_test} × 10 = "
           f"{(args.n_train + args.n_val + args.n_test) * 10})", flush=True)
-    print(f"[manifest] DBSCAN  eps={DBSCAN_EPS}  "
-          f"min_samples={DBSCAN_MIN_SAMPLES}  on stl_centers[:, :2]",
+    print(f"[manifest] DBSCAN  eps={args.dbscan_eps}  "
+          f"min_samples={args.dbscan_min_samples}  on stl_centers[:, :2]",
           flush=True)
 
     # ── Step 1: features ──
@@ -297,7 +296,7 @@ def main() -> int:
         t0 = time.time()
         feats = []
         if args.workers <= 1:
-            _init_worker()
+            _init_worker(args.dbscan_eps, args.dbscan_min_samples)
             for i, pp in enumerate(pt_paths):
                 rec = _process_one(pp)
                 if rec is not None:
@@ -306,7 +305,9 @@ def main() -> int:
                     print(f"  [{i + 1}/{len(pt_paths)}] features extracted",
                           flush=True)
         else:
-            pool = mp.Pool(args.workers, initializer=_init_worker)
+            pool = mp.Pool(args.workers, initializer=_init_worker,
+                           initargs=(args.dbscan_eps,
+                                     args.dbscan_min_samples))
             try:
                 for i, rec in enumerate(pool.imap_unordered(
                         _process_one, pt_paths, chunksize=4)):
@@ -442,8 +443,8 @@ def main() -> int:
                       if n_surf_sorted else 0,
         },
         "dbscan": {
-            "eps": DBSCAN_EPS,
-            "min_samples": DBSCAN_MIN_SAMPLES,
+            "eps": args.dbscan_eps,
+            "min_samples": args.dbscan_min_samples,
             "feature": "stl_centers[:, :2]",
         },
         "anomaly_results": {
