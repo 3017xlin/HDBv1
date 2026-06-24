@@ -190,21 +190,78 @@ def train(cfg: dict) -> None:
     with open(manifest_path) as f:
         manifest = json.load(f)
 
-    all_train_ids = manifest['splits']['train']
-    my_train_ids = sorted(all_train_ids[rank::world])
+    # Stratified sharding: split cases per sub-bin so every rank gets
+    # the same bin distribution (±1 case). Prevents DDP dead-lock from
+    # unequal batch counts across ranks.
+    all_train_entries = manifest['splits']['train']
+    bin_to_cases: dict[str, list[str]] = {}
+    has_sub_bin_info = False
+    for entry in all_train_entries:
+        if isinstance(entry, dict):
+            cid = entry['case_name']
+            sb = entry.get('sub_bin', 'unknown')
+            if sb != 'unknown':
+                has_sub_bin_info = True
+        else:
+            cid = str(entry)
+            sb = 'unknown'
+        bin_to_cases.setdefault(sb, []).append(cid)
 
-    if rank == 0:
-        print(f'[data] loading {len(my_train_ids)} train cases ...', flush=True)
-    all_pt_data = load_cases_pinned(
-        cache_dir, my_train_ids,
-        num_workers=int(cfg['training'].get('num_workers', 30)))
+    if has_sub_bin_info:
+        # Manifest has sub_bin info: stratified split before loading
+        my_train_ids: list[str] = []
+        sub_bin_map: dict[str, str] = {}
+        cases_per_bin: dict[str, list] = {}
+        for sb in SUB_BIN_ORDER:
+            cases_in_bin = sorted(bin_to_cases.get(sb, []))
+            my_slice = cases_in_bin[rank::world]
+            for cid in my_slice:
+                sub_bin_map[cid] = sb
+            cases_per_bin[sb] = my_slice
+            my_train_ids.extend(my_slice)
+        for sb, cids in bin_to_cases.items():
+            if sb not in SUB_BIN_ORDER:
+                cases_in_bin = sorted(cids)
+                my_slice = cases_in_bin[rank::world]
+                for cid in my_slice:
+                    sub_bin_map[cid] = sb
+                cases_per_bin[sb] = my_slice
+                my_train_ids.extend(my_slice)
 
-    sub_bin_map: dict[str, str] = {}
-    cases_per_bin: dict[str, list] = {}
-    for cid in my_train_ids:
-        sb = all_pt_data[cid]['sub_bin']
-        sub_bin_map[cid] = sb
-        cases_per_bin.setdefault(sb, []).append(cid)
+        if rank == 0:
+            print(f'[data] stratified shard: loading {len(my_train_ids)} '
+                  f'train cases ...', flush=True)
+            for sb in SUB_BIN_ORDER:
+                if cases_per_bin.get(sb):
+                    print(f'  {sb}: {len(cases_per_bin[sb])} (this rank)',
+                          flush=True)
+        all_pt_data = load_cases_pinned(
+            cache_dir, my_train_ids,
+            num_workers=int(cfg['training'].get('num_workers', 30)))
+    else:
+        # Manifest has plain string IDs: load all my cases first, then
+        # rebuild stratified split from PT sub_bin metadata.
+        all_ids = sorted(bin_to_cases.get('unknown', []))
+        my_ids_raw = sorted(all_ids[rank::world])
+        if rank == 0:
+            print(f'[data] loading {len(my_ids_raw)} train cases '
+                  f'(will re-shard by sub_bin) ...', flush=True)
+        all_pt_data = load_cases_pinned(
+            cache_dir, my_ids_raw,
+            num_workers=int(cfg['training'].get('num_workers', 30)))
+
+        sub_bin_map = {}
+        cases_per_bin = {}
+        my_train_ids = list(my_ids_raw)
+        for cid in my_train_ids:
+            sb = all_pt_data[cid]['sub_bin']
+            sub_bin_map[cid] = sb
+            cases_per_bin.setdefault(sb, []).append(cid)
+        if rank == 0:
+            for sb in SUB_BIN_ORDER:
+                if cases_per_bin.get(sb):
+                    print(f'  {sb}: {len(cases_per_bin[sb])} (this rank)',
+                          flush=True)
 
     val_ids = manifest['splits']['val']
     my_val_ids = sorted(val_ids[rank::world])
