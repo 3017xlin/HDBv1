@@ -1,47 +1,41 @@
 #!/usr/bin/env python3
 """Build manifest.json for HDB preprocessing pipeline.
 
-This is the file that ``preprocess/build_cache.py`` consumes via
-``cfg['data']['manifest_path']`` (default ``~/scratch/manifest.json``).
+Pipeline (the one true ordering):
 
-It scans ``cfg['data']['physical_pt_dir']`` (default ``~/scratch/HDB``),
-classifies every ``*.pt`` case into one of the 10 sub-bins defined in
-``cfg['sub_bin_L']`` (``0-19_easy`` … ``80-123_hard``), and writes a
-stratified 70 / 15 / 15 train / val / test split.
+  1. Scan ``physical_pt_dir`` for every ``*.pt`` (≈ 7154 cases).
+  2. Single parallel pass over every PT extracting in one load:
+       * the 19 MAD anomaly indicators (preprocess/anomaly_detect.py)
+       * ``n_buildings`` — connected components of ``stl_faces``
+       * ``n_vol``       — ``volume_pos.shape[0]``
+  3. Run ``detect_anomalies_mad`` → flag anomalous cases → drop them.
+  4. Assign each surviving case to a **range** by ``n_buildings``
+     (hard cutoffs, not quantiles)::
 
-Classification rules
---------------------
-* ``--rule size``       — file size in bytes (FAST: no PT loaded).
-* ``--rule ntotal``     — ``volume_pos.shape[0] + surface_pos.shape[0]``
-                          (loads each PT once, parallel).
-* ``--rule ncomponents``— count connected mesh components from
-                          ``stl_faces`` via union-find = number of
-                          buildings.  Slowest but most faithful to the
-                          "0-19 … 80-123" naming.
+        n ≤ 19  → "0-19"
+        n ≤ 39  → "20-39"
+        n ≤ 59  → "40-59"
+        n ≤ 79  → "60-79"
+        else    → "80-123"
 
-For ``size`` / ``ntotal`` the 5 numeric ranges are assigned by
-**quintile** of the chosen metric across all cases; ``easy`` / ``hard``
-is the within-range median split.
+  5. Within each range, sort by ``n_vol``; lower half ⇒ ``easy``,
+     upper half ⇒ ``hard``.  Gives exactly 10 sub-bins.
+  6. Per sub-bin stratified, without-replacement split into
+     train / val / test (default 70 / 15 / 15).
+  7. Write ``manifest.json`` (path from ``cfg.data.manifest_path``).
 
-Output JSON layout (consumed by ``preprocess/build_cache.py`` and
-``training/loop.py``)::
+After this, the slow preprocess does NOT need to redo anomaly:
 
-    {
-      "splits": {
-        "train": [{"case_name": "...", "sub_bin": "0-19_easy"}, ...],
-        "val":   [...],
-        "test":  [...]
-      },
-      "rule":   "size",
-      "seed":   42,
-      "counts": {"train": 560, "val": 120, "test": 120},
-      "per_sub_bin": {"0-19_easy": 80, ...}
-    }
+    python preprocess/build_cache.py --config config.yaml \
+        --workers 80 --skip-anomaly
 
 Usage::
 
-    python build_manifest.py --config config.yaml          # default: size rule
-    python build_manifest.py --config config.yaml --rule ntotal --workers 40
+    python build_manifest.py --config config.yaml --workers 80
+    # Optional: cache the heavy per-case features so subsequent runs with
+    # different --train-frac / --seed don't re-read every PT.
+    python build_manifest.py --config config.yaml --workers 80 \
+        --features-cache ~/scratch/manifest_features.json
 """
 from __future__ import annotations
 
@@ -53,79 +47,36 @@ from collections import defaultdict
 from multiprocessing import Pool
 from pathlib import Path
 
+import numpy as np
 import yaml
+
+# ── Allow both `from hdb.preprocess.X import Y` (existing build_cache
+#    layout) and a plain `from preprocess.X import Y` (when extracted as
+#    HDBv1-<branch>/ without an `hdb/` symlink). ────────────────────────
+_REPO_ROOT = Path(__file__).resolve().parent
+for _p in (_REPO_ROOT, _REPO_ROOT.parent):
+    sp = str(_p)
+    if sp not in sys.path:
+        sys.path.insert(0, sp)
+
+try:
+    from hdb.preprocess.anomaly_detect import (
+        compute_case_stats, detect_anomalies_mad,
+    )
+except ImportError:
+    from preprocess.anomaly_detect import (  # type: ignore
+        compute_case_stats, detect_anomalies_mad,
+    )
+
 
 SUB_BIN_RANGES = ["0-19", "20-39", "40-59", "60-79", "80-123"]
 DIFFICULTIES = ["easy", "hard"]
 SUB_BIN_ORDER = [f"{r}_{d}" for r in SUB_BIN_RANGES for d in DIFFICULTIES]
 
 
-# ─── classification metric helpers ───────────────────────────────────
+# ─── range mapping (hard cutoffs, NOT quantiles) ───────────────────
 
-def metric_size(pt_path: str) -> int:
-    return os.path.getsize(pt_path)
-
-
-def metric_ntotal(pt_path: str) -> int:
-    """N_vol + N_surf from a physical PT (loaded once on CPU)."""
-    import torch  # local import so --rule size doesn't pay the cost
-    pt = torch.load(pt_path, map_location="cpu", weights_only=False)
-    vol_pos = pt["volume_pos"]
-    surf_pos = pt["surface_pos"]
-    n_vol = vol_pos.shape[0]
-    n_surf = surf_pos.shape[0]
-    return int(n_vol + n_surf)
-
-
-def metric_ncomponents(pt_path: str) -> int:
-    """Number of disconnected mesh components in stl_faces = buildings."""
-    import numpy as np
-    import torch
-    pt = torch.load(pt_path, map_location="cpu", weights_only=False)
-    faces = pt["stl_faces"]
-    if hasattr(faces, "numpy"):
-        faces = faces.numpy()
-    faces = np.asarray(faces).astype(np.int64)
-    n_vert = int(faces.max()) + 1
-
-    # Union-find on vertices via face edges.
-    parent = np.arange(n_vert, dtype=np.int64)
-
-    def find(x: int) -> int:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    for tri in faces:
-        a, b, c = int(tri[0]), int(tri[1]), int(tri[2])
-        ra, rb, rc = find(a), find(b), find(c)
-        if ra != rb:
-            parent[ra] = rb
-            ra = rb
-        if ra != rc:
-            parent[ra] = rc
-
-    roots = {find(v) for v in range(n_vert)}
-    return len(roots)
-
-
-_METRIC_FNS = {
-    "size": metric_size,
-    "ntotal": metric_ntotal,
-    "ncomponents": metric_ncomponents,
-}
-
-
-def _metric_worker(args):
-    rule, pt_path = args
-    fn = _METRIC_FNS[rule]
-    return os.path.basename(pt_path)[:-3], fn(pt_path)  # strip .pt
-
-
-# ─── range mapping ──────────────────────────────────────────────────
-
-def range_from_ncomponents(n: int) -> str:
+def range_from_nbuildings(n: int) -> str:
     if n <= 19:
         return "0-19"
     if n <= 39:
@@ -137,66 +88,92 @@ def range_from_ncomponents(n: int) -> str:
     return "80-123"
 
 
-def assign_quintile_range(metrics: dict[str, float]) -> dict[str, str]:
-    """Sort cases by metric → split into 5 equal-sized quintiles."""
-    items = sorted(metrics.items(), key=lambda kv: kv[1])
-    n = len(items)
-    out: dict[str, str] = {}
-    for i, (name, _) in enumerate(items):
-        q = min(4, int(5 * i / n))
-        out[name] = SUB_BIN_RANGES[q]
-    return out
+# ─── per-case worker (loads PT once, returns everything) ───────────
 
+def _per_case_worker(pt_path: str) -> dict:
+    """Load one PT, compute anomaly stats + n_buildings + n_vol."""
+    import torch
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import connected_components
 
-def assign_difficulty(
-    metrics: dict[str, float], range_of: dict[str, str]
-) -> dict[str, str]:
-    """Within each range, smaller-metric half = easy, larger half = hard."""
-    by_range: dict[str, list[tuple[str, float]]] = defaultdict(list)
-    for name, m in metrics.items():
-        by_range[range_of[name]].append((name, m))
+    pt = torch.load(pt_path, map_location="cpu", weights_only=False)
 
-    out: dict[str, str] = {}
-    for r, lst in by_range.items():
-        lst.sort(key=lambda kv: kv[1])
-        half = len(lst) // 2
-        for i, (name, _) in enumerate(lst):
-            out[name] = "easy" if i < half else "hard"
+    # tensors → numpy for compute_case_stats and downstream ops
+    pt_np: dict = {}
+    for k, v in pt.items():
+        if isinstance(v, torch.Tensor):
+            pt_np[k] = v.numpy()
+        else:
+            pt_np[k] = v
+
+    case_name = os.path.basename(pt_path)[:-3]  # strip ".pt"
+    pt_np.setdefault("case_name", case_name)
+
+    # Anomaly indicators (19 floats)
+    stats = compute_case_stats(pt_np)
+
+    # n_vol
+    n_vol = int(pt_np["volume_pos"].shape[0])
+
+    # n_buildings — connected components of the STL face graph
+    faces = np.asarray(pt_np["stl_faces"], dtype=np.int64)
+    n_vert = int(faces.max()) + 1
+    rows = np.concatenate([faces[:, 0], faces[:, 1], faces[:, 2]])
+    cols = np.concatenate([faces[:, 1], faces[:, 2], faces[:, 0]])
+    data = np.ones(rows.shape[0], dtype=np.bool_)
+    graph = csr_matrix((data, (rows, cols)), shape=(n_vert, n_vert))
+    n_buildings, _ = connected_components(graph, directed=False)
+
+    out = {
+        "case_name": case_name,
+        "pt_path": pt_path,
+        "n_vol": n_vol,
+        "n_buildings": int(n_buildings),
+    }
+    # Inject the 19 anomaly indicators directly (stats already has case_name)
+    for k, v in stats.items():
+        if k == "case_name":
+            continue
+        out[k] = v
     return out
 
 
 # ─── splits ─────────────────────────────────────────────────────────
 
 def stratified_split(
-    sub_bin_of: dict[str, str],
+    cases: list[dict],
     train_frac: float,
     val_frac: float,
     seed: int,
 ) -> dict[str, list[dict]]:
     import random
     rng = random.Random(seed)
-    by_sb: dict[str, list[str]] = defaultdict(list)
-    for name, sb in sub_bin_of.items():
-        by_sb[sb].append(name)
+    by_sb: dict[str, list[dict]] = defaultdict(list)
+    for c in cases:
+        by_sb[c["sub_bin"]].append(c)
 
     splits: dict[str, list[dict]] = {"train": [], "val": [], "test": []}
-    for sb, names in by_sb.items():
-        names = sorted(names)            # determinism before shuffle
-        rng.shuffle(names)
-        n = len(names)
+    for sb in SUB_BIN_ORDER:
+        lst = sorted(by_sb.get(sb, []), key=lambda c: c["case_name"])
+        rng.shuffle(lst)
+        n = len(lst)
         n_train = round(n * train_frac)
         n_val = round(n * val_frac)
         n_train = min(n_train, n)
         n_val = min(n_val, n - n_train)
-        for i, cn in enumerate(names):
+        for i, c in enumerate(lst):
             if i < n_train:
                 bucket = "train"
             elif i < n_train + n_val:
                 bucket = "val"
             else:
                 bucket = "test"
-            splits[bucket].append({"case_name": cn, "sub_bin": sb})
-
+            splits[bucket].append({
+                "case_name": c["case_name"],
+                "sub_bin": c["sub_bin"],
+                "n_buildings": c["n_buildings"],
+                "n_vol": c["n_vol"],
+            })
     for k in splits:
         splits[k].sort(key=lambda d: d["case_name"])
     return splits
@@ -205,13 +182,11 @@ def stratified_split(
 # ─── main ───────────────────────────────────────────────────────────
 
 def main() -> int:
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--config", required=True, help="Path to config.yaml")
-    p.add_argument("--rule", choices=list(_METRIC_FNS), default="size",
-                   help="Classification metric (default: size).")
-    p.add_argument("--workers", type=int, default=40,
-                   help="Parallel workers when --rule loads PTs (default 40).")
+    p.add_argument("--workers", type=int, default=40)
     p.add_argument("--train-frac", type=float, default=0.70)
     p.add_argument("--val-frac", type=float, default=0.15)
     p.add_argument("--seed", type=int, default=42)
@@ -219,6 +194,11 @@ def main() -> int:
                    help="Override cfg.data.physical_pt_dir.")
     p.add_argument("--out", default=None,
                    help="Override cfg.data.manifest_path output location.")
+    p.add_argument("--features-cache", default=None,
+                   help="JSON file caching per-case features. If exists, "
+                        "load it instead of re-reading every PT.")
+    p.add_argument("--no-anomaly-filter", action="store_true",
+                   help="Skip anomaly filtering (NOT recommended).")
     args = p.parse_args()
 
     if args.train_frac + args.val_frac >= 1.0:
@@ -248,61 +228,120 @@ def main() -> int:
         print(f"ERROR: no *.pt files found under {raw_dir}", file=sys.stderr)
         return 1
 
-    print(f"[manifest] {len(pt_paths)} cases found in {raw_dir}")
-    print(f"[manifest] rule={args.rule}  workers={args.workers}")
+    print(f"[manifest] scanning {len(pt_paths)} cases under {raw_dir}")
     print(f"[manifest] output: {out_path}")
+    print(f"[manifest] workers: {args.workers}  seed: {args.seed}")
+    print(f"[manifest] splits: train={args.train_frac:.2f} "
+          f"val={args.val_frac:.2f} "
+          f"test={1.0 - args.train_frac - args.val_frac:.2f}")
 
-    # ── compute metric for every case ──
-    metrics: dict[str, float] = {}
-    work = [(args.rule, p) for p in pt_paths]
-    if args.rule == "size":
-        for r, pp in work:
-            name, m = _metric_worker((r, pp))
-            metrics[name] = m
+    # ── 1+2. Per-case features (loads every PT once) ──
+    feats: list[dict]
+    if args.features_cache and os.path.exists(args.features_cache):
+        with open(args.features_cache) as f:
+            feats = json.load(f)
+        print(f"[manifest] loaded features from cache: "
+              f"{args.features_cache} ({len(feats)} cases)")
     else:
+        print(f"[manifest] computing features in parallel ...")
+        feats = []
         with Pool(args.workers) as pool:
-            for i, (name, m) in enumerate(pool.imap_unordered(_metric_worker, work)):
-                metrics[name] = m
-                if (i + 1) % 50 == 0 or (i + 1) == len(work):
-                    print(f"  [{args.rule}] {i + 1}/{len(work)} cases processed",
+            for i, rec in enumerate(pool.imap_unordered(_per_case_worker,
+                                                       pt_paths)):
+                feats.append(rec)
+                if (i + 1) % 100 == 0 or (i + 1) == len(pt_paths):
+                    print(f"  [{i + 1}/{len(pt_paths)}] features extracted",
                           flush=True)
+        if args.features_cache:
+            os.makedirs(os.path.dirname(args.features_cache) or ".",
+                        exist_ok=True)
+            with open(args.features_cache, "w") as f:
+                json.dump(feats, f)
+            print(f"[manifest] wrote features cache: {args.features_cache}")
 
-    # ── range assignment ──
-    if args.rule == "ncomponents":
-        range_of = {name: range_from_ncomponents(int(v))
-                    for name, v in metrics.items()}
+    # ── 3. Anomaly filter (MAD 19) ──
+    if args.no_anomaly_filter:
+        kept = feats
+        anomaly_results: dict[str, dict] = {}
+        print(f"[anomaly] SKIPPED (--no-anomaly-filter)")
     else:
-        range_of = assign_quintile_range(metrics)
+        # detect_anomalies_mad wants the same 19 fields per case (plus name).
+        # Our feats already contain those (compute_case_stats output spread in).
+        anomaly_results = detect_anomalies_mad(feats)
+        kept = [f for f in feats
+                if not anomaly_results.get(f["case_name"], {}).get(
+                    "is_anomaly", False)]
+        n_drop = len(feats) - len(kept)
+        print(f"[anomaly] {n_drop} dropped / {len(feats)} scanned "
+              f"({100 * n_drop / max(len(feats), 1):.1f} %)")
+        # Print rule breakdown
+        by_rule: dict[str, int] = defaultdict(int)
+        for cn, r in anomaly_results.items():
+            if r.get("is_anomaly"):
+                by_rule[r.get("rule", "?")] += 1
+        for rule, c in sorted(by_rule.items()):
+            print(f"  rule={rule:<18s} {c}")
 
-    # ── difficulty assignment (size-within-range proxy) ──
-    if args.rule == "ncomponents":
-        # Reuse file-size as the easy/hard tie-breaker so this rule still
-        # produces both halves.
-        size_metric = {name: metric_size(os.path.join(raw_dir, name + ".pt"))
-                       for name in metrics}
-        diff_of = assign_difficulty(size_metric, range_of)
-    else:
-        diff_of = assign_difficulty(metrics, range_of)
+    # ── 4. Range by n_buildings (hard cutoffs) ──
+    for f in kept:
+        f["range"] = range_from_nbuildings(f["n_buildings"])
 
-    sub_bin_of = {name: f"{range_of[name]}_{diff_of[name]}"
-                  for name in metrics}
+    # ── 5. Within each range, easy/hard by n_vol median ──
+    by_range: dict[str, list[dict]] = defaultdict(list)
+    for f in kept:
+        by_range[f["range"]].append(f)
+    for r, lst in by_range.items():
+        lst.sort(key=lambda c: c["n_vol"])
+        half = len(lst) // 2
+        for i, c in enumerate(lst):
+            c["sub_bin"] = f"{r}_{'easy' if i < half else 'hard'}"
 
-    # ── stratified split ──
-    splits = stratified_split(sub_bin_of, args.train_frac, args.val_frac,
-                              args.seed)
+    # ── 6. Stratified train/val/test ──
+    splits = stratified_split(kept, args.train_frac, args.val_frac, args.seed)
 
-    per_sb_counts: dict[str, int] = defaultdict(int)
-    for sb in sub_bin_of.values():
-        per_sb_counts[sb] += 1
+    # ── 7. Write manifest ──
+    per_sb_total: dict[str, int] = defaultdict(int)
+    per_sb_n_vol_median: dict[str, int] = {}
+    for c in kept:
+        per_sb_total[c["sub_bin"]] += 1
+    # report the median n_vol per range (for sanity-checking easy/hard cut)
+    for r, lst in by_range.items():
+        if lst:
+            n_vols = sorted(c["n_vol"] for c in lst)
+            mid = n_vols[len(n_vols) // 2]
+            per_sb_n_vol_median[r] = int(mid)
+
+    n_buildings_sorted = sorted(c["n_buildings"] for c in kept)
+    n_vol_sorted = sorted(c["n_vol"] for c in kept)
 
     manifest = {
         "splits": splits,
-        "rule": args.rule,
         "seed": args.seed,
-        "counts": {k: len(v) for k, v in splits.items()},
-        "per_sub_bin": {sb: per_sb_counts.get(sb, 0) for sb in SUB_BIN_ORDER},
         "physical_pt_dir": raw_dir,
-        "n_cases": len(metrics),
+        "n_scanned": len(feats),
+        "n_dropped_anomaly": len(feats) - len(kept),
+        "n_kept": len(kept),
+        "counts": {k: len(v) for k, v in splits.items()},
+        "per_sub_bin_total": {sb: per_sb_total.get(sb, 0)
+                              for sb in SUB_BIN_ORDER},
+        "range_n_vol_median_threshold": per_sb_n_vol_median,
+        "n_buildings_summary": {
+            "min": int(n_buildings_sorted[0]) if n_buildings_sorted else 0,
+            "max": int(n_buildings_sorted[-1]) if n_buildings_sorted else 0,
+            "median": int(n_buildings_sorted[len(n_buildings_sorted) // 2])
+                      if n_buildings_sorted else 0,
+        },
+        "n_vol_summary": {
+            "min": int(n_vol_sorted[0]) if n_vol_sorted else 0,
+            "max": int(n_vol_sorted[-1]) if n_vol_sorted else 0,
+            "median": int(n_vol_sorted[len(n_vol_sorted) // 2])
+                      if n_vol_sorted else 0,
+        },
+        "anomaly_results": {
+            cn: {"is_anomaly": r.get("is_anomaly", False),
+                 "rule": r.get("rule", "normal")}
+            for cn, r in anomaly_results.items()
+        } if not args.no_anomaly_filter else {},
     }
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
@@ -312,10 +351,14 @@ def main() -> int:
     print("\n[manifest] split counts:")
     for k, v in manifest["counts"].items():
         print(f"  {k:6s}: {v}")
-    print("\n[manifest] per sub-bin (all splits):")
+    print("\n[manifest] per sub-bin (kept):")
     for sb in SUB_BIN_ORDER:
-        print(f"  {sb:16s}: {per_sb_counts.get(sb, 0)}")
+        print(f"  {sb:16s}: {per_sb_total.get(sb, 0)}")
     print(f"\n[manifest] wrote {out_path}")
+    print("\nNext step (anomaly already done — pass --skip-anomaly):")
+    print("  nohup python preprocess/build_cache.py --config config.yaml "
+          "--workers 80 --skip-anomaly > ~/scratch/preprocess.log 2>&1 &")
+    print("  tail -f ~/scratch/preprocess.log")
     return 0
 
 
