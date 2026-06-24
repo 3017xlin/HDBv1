@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Build manifest.json for HDB preprocessing pipeline.
 
-Pipeline (the one true ordering):
+Pipeline:
 
   Step 1.  Scan ``physical_pt_dir`` for every ``*.pt`` (≈ 7154 cases).
            One parallel pass per PT extracting in a single load:
              * the 19 MAD anomaly indicators (preprocess/anomaly_detect.py)
-             * ``n_vol``  — ``volume_pos.shape[0]``
-             * ``n_surf`` — ``surface_pos.shape[0]``
-             * ``n_buildings`` — DBSCAN clusters on ``stl_vertices``
+             * ``n_volume``    = ``volume_fields.shape[0]``
+             * ``n_surface``   = ``surface_fields.shape[0]``
+             * ``n_buildings`` = DBSCAN clusters on ``stl_centers[:, :2]``
+                                 (top-down XY projection of face centroids)
 
   Step 2.  Run ``detect_anomalies_mad`` over the 19-indicator matrix and
            drop anomalous cases.
@@ -21,7 +22,7 @@ Pipeline (the one true ordering):
                n ≤ 79  → "60-79"
                else    → "80-123"
 
-           Within each range, sort by ``n_vol``; lower half ⇒ ``easy``,
+           Within each range, sort by ``n_volume``; lower half ⇒ ``easy``,
            upper half ⇒ ``hard``.  Exactly 10 sub-bins.
 
   Step 4.  From each sub-bin, sample WITHOUT replacement:
@@ -31,38 +32,33 @@ Pipeline (the one true ordering):
 
 After this, the slow preprocess does NOT need to redo anomaly:
 
-    nohup python preprocess/build_cache.py --config config.yaml \
+    nohup python preprocess/build_cache.py --config config.yaml \\
         --workers 80 --skip-anomaly > ~/scratch/preprocess.log 2>&1 &
     tail -f ~/scratch/preprocess.log
 
 Usage::
 
-    nohup python build_manifest.py --config config.yaml --workers 80 \
+    nohup python build_manifest.py --config config.yaml --workers 80 \\
+        --features-cache ~/scratch/manifest_features.json \\
         > ~/scratch/build_manifest.log 2>&1 &
     tail -f ~/scratch/build_manifest.log
-
-    # If you want to re-split (different seed / counts) without re-reading
-    # every PT, point at a feature cache:
-    nohup python build_manifest.py --config config.yaml --workers 80 \
-        --features-cache ~/scratch/manifest_features.json \
-        > ~/scratch/build_manifest.log 2>&1 &
 """
 from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing as mp
 import os
 import sys
+import time
 from collections import defaultdict
-from multiprocessing import Pool
 from pathlib import Path
 
 import numpy as np
 import yaml
 
-# ── Make `from hdb.preprocess.X import Y` (existing convention) and a
-#    bare `from preprocess.X import Y` (when the tarball extracts as
-#    HDBv1-<branch>/ without an `hdb/` symlink) both work. ────────────
+# ── Allow both `from hdb.preprocess.X import Y` (existing build_cache
+#    convention) and a bare `from preprocess.X import Y`. ──────────────
 _REPO_ROOT = Path(__file__).resolve().parent
 for _p in (_REPO_ROOT, _REPO_ROOT.parent):
     sp = str(_p)
@@ -83,6 +79,10 @@ SUB_BIN_RANGES = ["0-19", "20-39", "40-59", "60-79", "80-123"]
 DIFFICULTIES = ["easy", "hard"]
 SUB_BIN_ORDER = [f"{r}_{d}" for r in SUB_BIN_RANGES for d in DIFFICULTIES]
 
+# ── DBSCAN params (match the EDA: face centroids XY, eps=5m, min=10) ──
+DBSCAN_EPS = 5.0
+DBSCAN_MIN_SAMPLES = 10
+
 
 def range_from_nbuildings(n: int) -> str:
     """Hard cutoffs — NOT quantiles."""
@@ -97,27 +97,25 @@ def range_from_nbuildings(n: int) -> str:
     return "80-123"
 
 
-# ─── per-case worker ───────────────────────────────────────────────
+# ─── worker ────────────────────────────────────────────────────────
 
-_DBSCAN_EPS = 1.0
-_DBSCAN_MIN_SAMPLES = 5
-_DBSCAN_MAX_VERTS = 200_000  # cap subsample size for huge meshes
-
-
-def _set_dbscan(eps: float, min_samples: int, max_verts: int) -> None:
-    global _DBSCAN_EPS, _DBSCAN_MIN_SAMPLES, _DBSCAN_MAX_VERTS
-    _DBSCAN_EPS = eps
-    _DBSCAN_MIN_SAMPLES = min_samples
-    _DBSCAN_MAX_VERTS = max_verts
+def _init_worker() -> None:
+    for k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+              "NUMEXPR_NUM_THREADS", "TBB_NUM_THREADS"):
+        os.environ[k] = "1"
+    import torch
+    torch.set_num_threads(1)
 
 
-def _per_case_worker(pt_path: str) -> dict | None:
-    """Load one PT, compute anomaly stats + n_vol + n_surf + n_buildings."""
+def _process_one(pt_path_str: str) -> dict | None:
+    """Load one PT, return anomaly stats + n_volume + n_surface + n_buildings."""
     try:
         import torch
         from sklearn.cluster import DBSCAN
 
-        pt = torch.load(pt_path, map_location="cpu", weights_only=False)
+        pt = torch.load(pt_path_str, map_location="cpu", weights_only=False)
+
+        # tensors → numpy for compute_case_stats and downstream ops
         pt_np: dict = {}
         for k, v in pt.items():
             if isinstance(v, torch.Tensor):
@@ -125,40 +123,31 @@ def _per_case_worker(pt_path: str) -> dict | None:
             else:
                 pt_np[k] = v
 
-        case_name = os.path.basename(pt_path)[:-3]
-        pt_np.setdefault("case_name", case_name)
+        case_name = pt_np.get("case_name") or Path(pt_path_str).stem
+        pt_np["case_name"] = case_name
 
         # 19 anomaly indicators
         stats = compute_case_stats(pt_np)
 
-        # Point counts
-        n_vol = int(pt_np["volume_pos"].shape[0])
-        n_surf = int(pt_np["surface_pos"].shape[0])
+        # Point counts (match EDA: shape[0] of *_fields, not *_pos)
+        n_volume = int(pt_np["volume_fields"].shape[0])
+        n_surface = int(pt_np["surface_fields"].shape[0])
 
-        # n_buildings via DBSCAN on STL vertices
-        stl_vertices = np.asarray(pt_np["stl_vertices"], dtype=np.float32)
-        if stl_vertices.shape[0] > _DBSCAN_MAX_VERTS:
-            rng = np.random.RandomState(42)
-            idx = rng.choice(stl_vertices.shape[0],
-                             size=_DBSCAN_MAX_VERTS, replace=False)
-            stl_for_db = stl_vertices[idx]
-        else:
-            stl_for_db = stl_vertices
-
-        db = DBSCAN(eps=_DBSCAN_EPS,
-                    min_samples=_DBSCAN_MIN_SAMPLES,
-                    n_jobs=1).fit(stl_for_db)
-        labels = db.labels_
-        # exclude noise (-1) from cluster count
-        n_buildings = int(len(set(labels.tolist())) - (1 if -1 in labels else 0))
-        n_buildings = max(n_buildings, 1)  # degenerate-safe lower bound
+        # n_buildings via DBSCAN on stl_centers XY projection
+        stl_centers = np.asarray(pt_np["stl_centers"], dtype=np.float64)
+        xy = stl_centers[:, :2]
+        labels = DBSCAN(eps=DBSCAN_EPS,
+                        min_samples=DBSCAN_MIN_SAMPLES).fit_predict(xy)
+        clusters = set(labels.tolist())
+        clusters.discard(-1)
+        n_buildings = len(clusters)
 
         out = {
             "case_name": case_name,
-            "pt_path": pt_path,
-            "n_vol": n_vol,
-            "n_surf": n_surf,
-            "n_buildings": n_buildings,
+            "pt_path": pt_path_str,
+            "n_volume": n_volume,
+            "n_surface": n_surface,
+            "n_buildings": int(n_buildings),
         }
         for k, v in stats.items():
             if k == "case_name":
@@ -166,13 +155,9 @@ def _per_case_worker(pt_path: str) -> dict | None:
             out[k] = v
         return out
     except Exception as e:
-        return {"case_name": os.path.basename(pt_path)[:-3],
-                "pt_path": pt_path,
+        return {"case_name": Path(pt_path_str).stem,
+                "pt_path": pt_path_str,
                 "_error": f"{type(e).__name__}: {e}"}
-
-
-def _init_pool(eps: float, min_samples: int, max_verts: int) -> None:
-    _set_dbscan(eps, min_samples, max_verts)
 
 
 # ─── splits ─────────────────────────────────────────────────────────
@@ -198,7 +183,6 @@ def fixed_count_split(
         lst = sorted(by_sb.get(sb, []), key=lambda c: c["case_name"])
         rng.shuffle(lst)
         n_avail = len(lst)
-        # Greedy allocation respecting available count.
         take_train = min(n_train, n_avail)
         take_val = min(n_val, n_avail - take_train)
         take_test = min(n_test, n_avail - take_train - take_val)
@@ -220,14 +204,15 @@ def fixed_count_split(
             elif i < take_train + take_val + take_test:
                 bucket = "test"
             else:
-                continue  # rest of sub-bin discarded (per the spec)
+                continue
             splits[bucket].append({
                 "case_name": c["case_name"],
                 "sub_bin": c["sub_bin"],
                 "n_buildings": c["n_buildings"],
-                "n_vol": c["n_vol"],
-                "n_surf": c["n_surf"],
+                "n_volume": c["n_volume"],
+                "n_surface": c["n_surface"],
             })
+
     for k in splits:
         splits[k].sort(key=lambda d: d["case_name"])
     return splits, short
@@ -253,19 +238,20 @@ def main() -> int:
     p.add_argument("--out", default=None,
                    help="Override cfg.data.manifest_path output location.")
     p.add_argument("--features-cache", default=None,
-                   help="JSON file caching the per-case features (anomaly "
-                        "indicators + n_vol + n_surf + n_buildings). If "
-                        "present, reuse instead of re-reading every PT.")
-    p.add_argument("--dbscan-eps", type=float, default=1.0,
-                   help="DBSCAN eps (meters, default 1.0)")
-    p.add_argument("--dbscan-min-samples", type=int, default=5,
-                   help="DBSCAN min_samples (default 5)")
-    p.add_argument("--dbscan-max-verts", type=int, default=200_000,
-                   help="Subsample STL vertices to at most this many "
-                        "before DBSCAN (default 200000)")
+                   help="JSON file caching per-case features. If present, "
+                        "reuse instead of re-reading every PT.")
+    p.add_argument("--dbscan-eps", type=float, default=DBSCAN_EPS,
+                   help=f"DBSCAN eps (meters, default {DBSCAN_EPS})")
+    p.add_argument("--dbscan-min-samples", type=int, default=DBSCAN_MIN_SAMPLES,
+                   help=f"DBSCAN min_samples (default {DBSCAN_MIN_SAMPLES})")
     p.add_argument("--no-anomaly-filter", action="store_true",
                    help="Skip anomaly filtering (NOT recommended).")
     args = p.parse_args()
+
+    # Propagate DBSCAN params to module globals so workers see them.
+    global DBSCAN_EPS, DBSCAN_MIN_SAMPLES
+    DBSCAN_EPS = args.dbscan_eps
+    DBSCAN_MIN_SAMPLES = args.dbscan_min_samples
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f) or {}
@@ -288,51 +274,65 @@ def main() -> int:
         print(f"ERROR: no *.pt files found under {raw_dir}", file=sys.stderr)
         return 1
 
-    print(f"[manifest] {len(pt_paths)} cases under {raw_dir}")
-    print(f"[manifest] output: {out_path}")
-    print(f"[manifest] workers: {args.workers}  seed: {args.seed}")
+    print(f"[manifest] {len(pt_paths)} cases under {raw_dir}", flush=True)
+    print(f"[manifest] output: {out_path}", flush=True)
+    print(f"[manifest] workers: {args.workers}  seed: {args.seed}", flush=True)
     print(f"[manifest] per sub-bin: train={args.n_train} "
           f"val={args.n_val} test={args.n_test} "
           f"(total = {args.n_train + args.n_val + args.n_test} × 10 = "
-          f"{(args.n_train + args.n_val + args.n_test) * 10})")
-    print(f"[manifest] DBSCAN eps={args.dbscan_eps} "
-          f"min_samples={args.dbscan_min_samples}  "
-          f"max_verts={args.dbscan_max_verts}")
+          f"{(args.n_train + args.n_val + args.n_test) * 10})", flush=True)
+    print(f"[manifest] DBSCAN  eps={DBSCAN_EPS}  "
+          f"min_samples={DBSCAN_MIN_SAMPLES}  on stl_centers[:, :2]",
+          flush=True)
 
-    # ── Step 1: features (anomaly stats + counts + DBSCAN n_buildings) ──
+    # ── Step 1: features ──
     feats: list[dict]
     if args.features_cache and os.path.exists(args.features_cache):
         with open(args.features_cache) as f:
             feats = json.load(f)
         print(f"[step 1] loaded features from cache: "
-              f"{args.features_cache} ({len(feats)} cases)")
+              f"{args.features_cache} ({len(feats)} cases)", flush=True)
     else:
-        print(f"[step 1] computing features in parallel ...")
+        print(f"[step 1] computing features in parallel ...", flush=True)
+        t0 = time.time()
         feats = []
-        with Pool(args.workers,
-                  initializer=_init_pool,
-                  initargs=(args.dbscan_eps,
-                            args.dbscan_min_samples,
-                            args.dbscan_max_verts)) as pool:
-            for i, rec in enumerate(pool.imap_unordered(_per_case_worker,
-                                                       pt_paths)):
+        if args.workers <= 1:
+            _init_worker()
+            for i, pp in enumerate(pt_paths):
+                rec = _process_one(pp)
                 if rec is not None:
                     feats.append(rec)
                 if (i + 1) % 100 == 0 or (i + 1) == len(pt_paths):
                     print(f"  [{i + 1}/{len(pt_paths)}] features extracted",
                           flush=True)
+        else:
+            pool = mp.Pool(args.workers, initializer=_init_worker)
+            try:
+                for i, rec in enumerate(pool.imap_unordered(
+                        _process_one, pt_paths, chunksize=4)):
+                    if rec is not None:
+                        feats.append(rec)
+                    if (i + 1) % 100 == 0 or (i + 1) == len(pt_paths):
+                        print(f"  [{i + 1}/{len(pt_paths)}] features extracted",
+                              flush=True)
+            finally:
+                pool.close()
+                pool.join()
+        print(f"[step 1] done in {time.time() - t0:.1f}s", flush=True)
         if args.features_cache:
             os.makedirs(os.path.dirname(args.features_cache) or ".",
                         exist_ok=True)
             with open(args.features_cache, "w") as f:
                 json.dump(feats, f)
-            print(f"[step 1] wrote features cache: {args.features_cache}")
+            print(f"[step 1] wrote features cache: {args.features_cache}",
+                  flush=True)
 
-    # Drop records that errored out during loading.
+    # drop records that errored during loading
     bad = [f for f in feats if "_error" in f]
     feats = [f for f in feats if "_error" not in f]
     if bad:
-        print(f"[step 1] WARNING: {len(bad)} cases failed to load:")
+        print(f"[step 1] WARNING: {len(bad)} cases failed to load:",
+              flush=True)
         for f in bad[:10]:
             print(f"    {f['case_name']}: {f.get('_error')}")
         if len(bad) > 10:
@@ -342,7 +342,8 @@ def main() -> int:
     if args.no_anomaly_filter:
         kept = feats
         anomaly_results: dict[str, dict] = {}
-        print(f"[step 2] anomaly filter SKIPPED (--no-anomaly-filter)")
+        print(f"[step 2] anomaly filter SKIPPED (--no-anomaly-filter)",
+              flush=True)
     else:
         anomaly_results = detect_anomalies_mad(feats)
         kept = [f for f in feats
@@ -351,7 +352,7 @@ def main() -> int:
         n_drop = len(feats) - len(kept)
         print(f"[step 2] anomaly: dropped {n_drop} / {len(feats)} "
               f"({100 * n_drop / max(len(feats), 1):.1f} %)  "
-              f"→ {len(kept)} kept")
+              f"→ {len(kept)} kept", flush=True)
         by_rule: dict[str, int] = defaultdict(int)
         for cn, r in anomaly_results.items():
             if r.get("is_anomaly"):
@@ -359,7 +360,7 @@ def main() -> int:
         for rule, c in sorted(by_rule.items()):
             print(f"    rule={rule:<18s} {c}")
 
-    # ── Step 3: range (hard cutoff on n_buildings) + easy/hard by n_vol ──
+    # ── Step 3: range (hard cutoff on n_buildings) + easy/hard by n_volume ──
     for f in kept:
         f["range"] = range_from_nbuildings(f["n_buildings"])
 
@@ -372,11 +373,12 @@ def main() -> int:
         lst = by_range.get(r, [])
         if not lst:
             continue
-        lst.sort(key=lambda c: c["n_vol"])
+        lst.sort(key=lambda c: c["n_volume"])
         half = len(lst) // 2
-        if lst:
-            range_n_vol_median[r] = int(lst[half - 1]["n_vol"]) \
-                                    if half > 0 else int(lst[0]["n_vol"])
+        if half > 0:
+            range_n_vol_median[r] = int(lst[half - 1]["n_volume"])
+        else:
+            range_n_vol_median[r] = int(lst[0]["n_volume"])
         for i, c in enumerate(lst):
             c["sub_bin"] = f"{r}_{'easy' if i < half else 'hard'}"
 
@@ -384,10 +386,11 @@ def main() -> int:
     for c in kept:
         per_sub_bin_total[c["sub_bin"]] += 1
 
-    print(f"[step 3] sub-bin populations (after binning, before sampling):")
+    print(f"[step 3] sub-bin populations (after binning, before sampling):",
+          flush=True)
+    need = args.n_train + args.n_val + args.n_test
     for sb in SUB_BIN_ORDER:
         n = per_sub_bin_total.get(sb, 0)
-        need = args.n_train + args.n_val + args.n_test
         flag = "" if n >= need else f"  ⚠ < {need}"
         print(f"    {sb:16s}: {n}{flag}")
 
@@ -396,14 +399,15 @@ def main() -> int:
         kept, args.n_train, args.n_val, args.n_test, args.seed)
 
     if short:
-        print(f"[step 4] WARNING: {len(short)} sub-bin(s) under-supplied:")
+        print(f"[step 4] WARNING: {len(short)} sub-bin(s) under-supplied:",
+              flush=True)
         for sb, info in short.items():
             print(f"    {sb}: {info}")
 
     # ── Step 5: write manifest ──
     n_buildings_sorted = sorted(c["n_buildings"] for c in kept)
-    n_vol_sorted = sorted(c["n_vol"] for c in kept)
-    n_surf_sorted = sorted(c["n_surf"] for c in kept)
+    n_vol_sorted = sorted(c["n_volume"] for c in kept)
+    n_surf_sorted = sorted(c["n_surface"] for c in kept)
 
     manifest = {
         "splits": splits,
@@ -425,22 +429,22 @@ def main() -> int:
             "median": int(n_buildings_sorted[len(n_buildings_sorted) // 2])
                       if n_buildings_sorted else 0,
         },
-        "n_vol_summary": {
+        "n_volume_summary": {
             "min": int(n_vol_sorted[0]) if n_vol_sorted else 0,
             "max": int(n_vol_sorted[-1]) if n_vol_sorted else 0,
             "median": int(n_vol_sorted[len(n_vol_sorted) // 2])
                       if n_vol_sorted else 0,
         },
-        "n_surf_summary": {
+        "n_surface_summary": {
             "min": int(n_surf_sorted[0]) if n_surf_sorted else 0,
             "max": int(n_surf_sorted[-1]) if n_surf_sorted else 0,
             "median": int(n_surf_sorted[len(n_surf_sorted) // 2])
                       if n_surf_sorted else 0,
         },
         "dbscan": {
-            "eps": args.dbscan_eps,
-            "min_samples": args.dbscan_min_samples,
-            "max_verts": args.dbscan_max_verts,
+            "eps": DBSCAN_EPS,
+            "min_samples": DBSCAN_MIN_SAMPLES,
+            "feature": "stl_centers[:, :2]",
         },
         "anomaly_results": {
             cn: {"is_anomaly": r.get("is_anomaly", False),
@@ -465,4 +469,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
     sys.exit(main())
