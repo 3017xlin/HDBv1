@@ -42,20 +42,21 @@ import torch
 import yaml
 from tqdm import tqdm
 
-# Ensure project root on sys.path
-_PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
+# Ensure project root on sys.path so `from preprocess.X import Y`
+# resolves regardless of the project directory name.
+_PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from hdb.preprocess.anomaly_detect import compute_case_stats, detect_anomalies_mad
-from hdb.preprocess.curvature import compute_curvature
-from hdb.preprocess.leaf_stats import compute_leaf_stats_vectorized
-from hdb.preprocess.neighbors import compute_latent_neighbors, compute_top256
-from hdb.preprocess.pbd import compute_pbd
-from hdb.preprocess.precompute import add_precomputed_fields
-from hdb.preprocess.rope_scale import compute_rope_scales
-from hdb.preprocess.sdf_binning import build_sdf_bin_edges, weighted_kmeans_allocation
-from hdb.preprocess.zscore import (
+from preprocess.anomaly_detect import compute_case_stats, detect_anomalies_mad
+from preprocess.curvature import compute_curvature
+from preprocess.leaf_stats import compute_leaf_stats_vectorized
+from preprocess.neighbors import compute_latent_neighbors, compute_top256
+from preprocess.pbd import compute_pbd
+from preprocess.precompute import add_precomputed_fields
+from preprocess.rope_scale import compute_rope_scales
+from preprocess.sdf_binning import build_sdf_bin_edges, weighted_kmeans_allocation
+from preprocess.zscore import (
     apply_zscore,
     compute_norm_stats,
     load_norm_stats,

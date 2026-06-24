@@ -19,9 +19,9 @@ from typing import Any
 import numpy as np
 import torch
 
-from hdb.models.bigbird import build_block_mask_direct
-from hdb.training.transient import build_transient1, build_transient2
-from hdb.utils.seed import per_case_epoch_seed
+from models.bigbird import build_block_mask_direct
+from training.transient import build_transient1, build_transient2
+from utils.seed import per_case_epoch_seed
 
 
 def _tensor_to_np(x: torch.Tensor | np.ndarray) -> np.ndarray:

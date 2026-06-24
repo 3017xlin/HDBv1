@@ -8,7 +8,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from hdb.utils.seed import make_rng, per_case_epoch_seed
+from utils.seed import make_rng, per_case_epoch_seed
 
 
 def _np(x):

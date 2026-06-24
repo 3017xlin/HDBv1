@@ -22,9 +22,9 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from hdb.models.encoder import build_leaf_aggregate
-from hdb.models.idw import gpu_idw
-from hdb.training.ddp import is_distributed
+from models.encoder import build_leaf_aggregate
+from models.idw import gpu_idw
+from training.ddp import is_distributed
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +220,7 @@ def _encode_case(model, pt: dict, device: torch.device, cfg: dict
     rope_sin = pt["rope_sin"].unsqueeze(0).to(device, non_blocking=True)
 
     # FlexAttention BlockMask
-    from hdb.models.bigbird import build_block_mask_direct
+    from models.bigbird import build_block_mask_direct
     flex_mask = build_block_mask_direct(
         batch["bigbird_key_idx"], L=L, R=register_tokens)
 

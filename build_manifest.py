@@ -57,22 +57,15 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-# ── Allow both `from hdb.preprocess.X import Y` (existing build_cache
-#    convention) and a bare `from preprocess.X import Y`. ──────────────
+# ── Repo root on sys.path so `from preprocess.X import Y` resolves
+#    regardless of whether the project dir is named `hdb`. ────────────
 _REPO_ROOT = Path(__file__).resolve().parent
-for _p in (_REPO_ROOT, _REPO_ROOT.parent):
-    sp = str(_p)
-    if sp not in sys.path:
-        sys.path.insert(0, sp)
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-try:
-    from hdb.preprocess.anomaly_detect import (
-        compute_case_stats, detect_anomalies_mad,
-    )
-except ImportError:
-    from preprocess.anomaly_detect import (  # type: ignore
-        compute_case_stats, detect_anomalies_mad,
-    )
+from preprocess.anomaly_detect import (
+    compute_case_stats, detect_anomalies_mad,
+)
 
 
 SUB_BIN_RANGES = ["0-19", "20-39", "40-59", "60-79", "80-123"]
