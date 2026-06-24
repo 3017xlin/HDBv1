@@ -136,11 +136,12 @@ def step_imports() -> None:
             fail(f"{pkg:<12s} import failed: {e}")
 
 
-def step_physical_pt_dir(cfg: dict) -> tuple[str, list[str]]:
+def step_physical_pt_dir(cfg: dict, override: str | None) -> tuple[str, list[str]]:
     heading("STEP 3 — physical_pt_dir + sample PT")
-    raw_dir = os.path.expanduser(
-        cfg.get("data", {}).get("physical_pt_dir", "~/scratch/HDB"))
-    raw_dir = str(Path(raw_dir).resolve())
+    raw = override or cfg.get("data", {}).get("physical_pt_dir", "~/scratch/HDB")
+    raw_dir = str(Path(os.path.expanduser(raw)).resolve())
+    if override:
+        print(f"    (override) physical_pt_dir = {raw_dir}")
 
     if not os.path.isdir(raw_dir):
         fail(f"directory does not exist: {raw_dir}")
@@ -280,6 +281,8 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--config", required=True, help="Path to config.yaml")
+    p.add_argument("--physical-pt-dir", default=None,
+                   help="Override cfg.data.physical_pt_dir for this check.")
     p.add_argument("--check-gpu", action="store_true",
                    help="Also run a CUDA visibility check.")
     args = p.parse_args()
@@ -290,7 +293,7 @@ def main() -> int:
         return 1
 
     step_imports()
-    raw_dir, pt_paths = step_physical_pt_dir(cfg)
+    raw_dir, pt_paths = step_physical_pt_dir(cfg, args.physical_pt_dir)
     step_sample_pt(pt_paths)
     cache_dir = step_writable_dirs(cfg)
     raw_total = sum(os.path.getsize(p) for p in pt_paths) if pt_paths else 0
