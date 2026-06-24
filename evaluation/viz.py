@@ -201,12 +201,12 @@ def plot_error_distribution(
 def plot_train_val_curve(
     curve_data: dict[int, dict[str, float]],
     out_dir: str | Path,
-    swa_start_epoch: int = 300,
+    swa_start_epoch: int = 400,
     filename: str = "train_val_curve.png",
 ) -> str:
-    """Plot train_eval and val z-score MSE curves over epochs.
+    """Plot train loss and val z-score MSE curves over Phase 2 epochs.
 
-    curve_data: {epoch: {'train_eval_vol_mse': ..., 'train_eval_surf_mse': ...,
+    curve_data: {epoch: {'train_vol_mse': ..., 'train_surf_mse': ...,
                          'val_vol_mse': ..., 'val_surf_mse': ...}}
 
     Returns path to saved PNG.
@@ -219,14 +219,14 @@ def plot_train_val_curve(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     epochs = sorted(curve_data.keys())
-    te_vol = [curve_data[e].get("train_eval_vol_mse", 0) for e in epochs]
-    te_surf = [curve_data[e].get("train_eval_surf_mse", 0) for e in epochs]
+    tr_vol = [curve_data[e].get("train_vol_mse", 0) for e in epochs]
+    tr_surf = [curve_data[e].get("train_surf_mse", 0) for e in epochs]
     v_vol = [curve_data[e].get("val_vol_mse", 0) for e in epochs]
     v_surf = [curve_data[e].get("val_surf_mse", 0) for e in epochs]
 
     fig, (ax_v, ax_s) = plt.subplots(1, 2, figsize=(14, 5), sharex=True)
 
-    ax_v.plot(epochs, te_vol, label="train_eval", color="C0", lw=1.5)
+    ax_v.plot(epochs, tr_vol, label="train", color="C0", lw=1.5)
     ax_v.plot(epochs, v_vol, label="val", color="C3", lw=1.5)
     ax_v.set_title("Volume 5d z-score MSE")
     ax_v.legend()
@@ -235,7 +235,7 @@ def plot_train_val_curve(
     ax_v.set_xlabel("Epoch")
     ax_v.grid(alpha=0.3)
 
-    ax_s.plot(epochs, te_surf, label="train_eval", color="C0", lw=1.5)
+    ax_s.plot(epochs, tr_surf, label="train", color="C0", lw=1.5)
     ax_s.plot(epochs, v_surf, label="val", color="C3", lw=1.5)
     ax_s.set_title("Surface 1d z-score MSE")
     ax_s.legend()

@@ -6,14 +6,11 @@ Entry point:
 Per-rank flow:
     init_ddp → load+pin train/val cases → build model → DDP wrap →
     torch.compile(reduce-overhead) → for epoch:
-        curriculum sampling → build_grouped_shard → AsyncPrefetcher →
-        for batch: BlockMask(CPU) → H2D → gpu_idw → forward(bf16) →
-            loss → backward → clip → step
-        val_curve(50 cases, 500K, z-score MSE)
-        train_eval_curve(40 cases, same)
-        SWA snapshot (epochs 300-399)
-        checkpoint
-    finalize: save swa_model.pt
+        Phase 1 (0 .. curriculum_epochs-1): curriculum sampling
+        Phase 2 (curriculum_epochs .. num_epochs-1): all cases equal weight + val eval + SWA
+        build_grouped_shard → DDP batch padding → AsyncPrefetcher →
+        for batch: H2D → gpu_idw → forward(bf16) → loss → backward → clip → step
+    finalize: save swa_model.pt + train/val curve plot
 """
 from __future__ import annotations
 
@@ -109,12 +106,16 @@ def evaluate_split(
     case_ids: list,
     epoch: int,
     device: torch.device,
-) -> float:
-    """500K sampled z-score MSE evaluation on a set of cases."""
-    if not case_ids:
-        return 0.0
+) -> dict[str, float]:
+    """500K sampled z-score MSE evaluation on a set of cases.
 
-    total_loss = 0.0
+    Returns dict with vol_mse, surf_mse, total_mse.
+    """
+    if not case_ids:
+        return {'vol_mse': 0.0, 'surf_mse': 0.0, 'total_mse': 0.0}
+
+    total_vol = 0.0
+    total_surf = 0.0
     n_cases = 0
 
     for cid in case_ids:
@@ -157,18 +158,24 @@ def evaluate_split(
                 flex_mask=flex_mask,
                 n_query_vol=n_qv,
             )
-            loss_v = F.mse_loss(
-                pred_vol, batch['query_target_volume'][:, :n_qv])
-            loss_s = F.mse_loss(
-                pred_surf, batch['query_target_surface'])
-            total_loss += (loss_v + loss_s).item()
+            total_vol += F.mse_loss(
+                pred_vol, batch['query_target_volume'][:, :n_qv]).item()
+            total_surf += F.mse_loss(
+                pred_surf, batch['query_target_surface']).item()
             n_cases += 1
 
     if is_distributed():
-        t = torch.tensor([total_loss, float(n_cases)], device=device)
+        t = torch.tensor([total_vol, total_surf, float(n_cases)],
+                         device=device)
         dist.all_reduce(t, op=dist.ReduceOp.SUM)
-        return float(t[0] / max(t[1], 1))
-    return total_loss / max(n_cases, 1)
+        d = max(float(t[2]), 1.0)
+        vol = float(t[0]) / d
+        surf = float(t[1]) / d
+    else:
+        d = max(n_cases, 1)
+        vol = total_vol / d
+        surf = total_surf / d
+    return {'vol_mse': vol, 'surf_mse': surf, 'total_mse': vol + surf}
 
 
 def train(cfg: dict) -> None:
@@ -296,9 +303,10 @@ def train(cfg: dict) -> None:
         model, cfg, world, steps_per_epoch_est)
 
     # ------------------------------------------------------------ curriculum
+    curriculum_epochs = int(cfg['training'].get('curriculum_epochs', 400))
     curriculum = CurriculumScheduler(
         SUB_BIN_ORDER, cases_per_bin,
-        T_start=3.0, T_end=1.0, total_epochs=total_epochs)
+        T_start=3.0, T_end=1.0, total_epochs=curriculum_epochs)
 
     # ------------------------------------------------------------------ swa
     swa_window = int(cfg['training'].get('swa_window', 100))
@@ -323,18 +331,35 @@ def train(cfg: dict) -> None:
               f'lr={opt.param_groups[0]["lr"]:.3e}', flush=True)
 
     # ============================================================ EPOCH LOOP
+    curve_data: dict[int, dict[str, float]] = {}
+
     for epoch in range(start_epoch, total_epochs):
         torch.cuda.reset_peak_memory_stats(device)
         rng_epoch = np.random.default_rng(cfg.get('seed', 42) + epoch)
+        is_phase2 = epoch >= curriculum_epochs
 
-        # 1. Curriculum sampling
-        sampled_ids = curriculum.get_epoch_samples(epoch, rng_epoch)
+        # 1. Sampling: curriculum (phase 1) or all cases equal (phase 2)
+        if is_phase2:
+            sampled_ids = list(my_train_ids)
+        else:
+            sampled_ids = curriculum.get_epoch_samples(epoch, rng_epoch)
 
         # 2. Build grouped shard (batches of same sub-bin)
         batches = build_grouped_shard(
             sampled_ids, sub_bin_map, epoch, rng_epoch)
 
-        # 3. Prefetcher (builds BlockMask in background thread)
+        # 3. DDP batch padding: ensure all ranks run the same number
+        #    of steps so backward all-reduce never hangs.
+        if is_distributed():
+            n_local = torch.tensor([len(batches)], device=device,
+                                   dtype=torch.long)
+            dist.all_reduce(n_local, op=dist.ReduceOp.MAX)
+            max_batches = int(n_local.item())
+            orig_len = len(batches)
+            while len(batches) < max_batches:
+                batches.append(batches[(len(batches) - orig_len) % orig_len])
+
+        # 4. Prefetcher (builds BlockMask in background thread)
         prefetcher = AsyncPrefetcher(
             batches, all_pt_data, epoch,
             encoder_k=int(cfg['model'].get('encoder_k', 32)),
@@ -405,41 +430,59 @@ def train(cfg: dict) -> None:
 
         prefetcher.close()
 
-        # ================================================= EVAL CURVES
-        val_loss = evaluate_split(
-            compiled, val_pt_data, my_val_ids, epoch, device)
+        avg_vol = epoch_loss_vol / max(n_steps, 1)
+        avg_surf = epoch_loss_surf / max(n_steps, 1)
 
-        # ======================================================== SWA
-        swa.accumulate(model, epoch)
+        # ================================================= EVAL + SWA
+        val_metrics: dict[str, float] = {}
+        if is_phase2:
+            val_metrics = evaluate_split(
+                compiled, val_pt_data, my_val_ids, epoch, device)
+            swa.accumulate(model, epoch)
+            curve_data[epoch] = {
+                'train_vol_mse': avg_vol,
+                'train_surf_mse': avg_surf,
+                'val_vol_mse': val_metrics['vol_mse'],
+                'val_surf_mse': val_metrics['surf_mse'],
+            }
 
         # ====================================================== LOG
         if rank == 0:
-            avg_total = (epoch_loss_vol + epoch_loss_surf) / max(n_steps, 1)
-            avg_vol = epoch_loss_vol / max(n_steps, 1)
-            avg_surf = epoch_loss_surf / max(n_steps, 1)
-            T_curr = curriculum.temperature(epoch)
-            print(
-                f'[epoch {epoch:03d}] '
-                f'loss={avg_total:.5f} (vol={avg_vol:.5f} surf={avg_surf:.5f}) '
-                f'val={val_loss:.5f} '
-                f'lr={sched.get_last_lr()[0]:.3e} T={T_curr:.2f} '
-                f'steps={n_steps} '
-                f'gpu={gpu_peak_gib(local):.1f}GiB '
-                f'cpu={cpu_rss_gib():.1f}GiB '
-                f't={time.time() - t_epoch:.1f}s',
-                flush=True,
-            )
+            avg_total = avg_vol + avg_surf
+            if is_phase2:
+                print(
+                    f'[epoch {epoch:03d} P2] '
+                    f'loss={avg_total:.5f} (vol={avg_vol:.5f} surf={avg_surf:.5f}) '
+                    f'val={val_metrics["total_mse"]:.5f} '
+                    f'(v={val_metrics["vol_mse"]:.5f} s={val_metrics["surf_mse"]:.5f}) '
+                    f'lr={sched.get_last_lr()[0]:.3e} '
+                    f'steps={n_steps} '
+                    f'gpu={gpu_peak_gib(local):.1f}GiB '
+                    f'cpu={cpu_rss_gib():.1f}GiB '
+                    f't={time.time() - t_epoch:.1f}s',
+                    flush=True,
+                )
+            else:
+                T_curr = curriculum.temperature(epoch)
+                print(
+                    f'[epoch {epoch:03d} P1] '
+                    f'loss={avg_total:.5f} (vol={avg_vol:.5f} surf={avg_surf:.5f}) '
+                    f'lr={sched.get_last_lr()[0]:.3e} T={T_curr:.2f} '
+                    f'steps={n_steps} '
+                    f'gpu={gpu_peak_gib(local):.1f}GiB '
+                    f't={time.time() - t_epoch:.1f}s',
+                    flush=True,
+                )
 
         # ================================================= CHECKPOINT
         ckpt_every_pre = int(cfg['checkpoint'].get('every_epochs_pre_swa', 10))
         ckpt_every_swa = int(cfg['checkpoint'].get('every_epochs_swa', 5))
-        swa_start = total_epochs - swa_window
         if rank == 0:
             do_ckpt = False
-            if epoch < swa_start:
-                do_ckpt = (epoch + 1) % ckpt_every_pre == 0
+            if is_phase2:
+                do_ckpt = (epoch - curriculum_epochs) % ckpt_every_swa == 0
             else:
-                do_ckpt = (epoch - swa_start) % ckpt_every_swa == 0
+                do_ckpt = (epoch + 1) % ckpt_every_pre == 0
             if do_ckpt:
                 save_checkpoint(
                     model, opt, sched, epoch,
@@ -450,11 +493,28 @@ def train(cfg: dict) -> None:
             dist.barrier()
 
     # ========================================================= FINALIZE
-    if rank == 0 and swa.has_snapshots():
-        avg_sd = swa.get_averaged()
-        swa_path = os.path.join(run_dir, 'swa_model.pt')
-        torch.save(avg_sd, swa_path)
-        print(f'[done] SWA model → {swa_path}', flush=True)
+    if rank == 0:
+        if swa.has_snapshots():
+            avg_sd = swa.get_averaged()
+            swa_path = os.path.join(run_dir, 'swa_model.pt')
+            torch.save(avg_sd, swa_path)
+            print(f'[done] SWA model → {swa_path}', flush=True)
+
+        if curve_data:
+            curve_path = os.path.join(run_dir, 'curve_data.json')
+            with open(curve_path, 'w') as f:
+                json.dump({str(k): v for k, v in curve_data.items()}, f,
+                          indent=2)
+            print(f'[done] curve data → {curve_path}', flush=True)
+            try:
+                from hdb.evaluation.viz import plot_train_val_curve
+                png = plot_train_val_curve(
+                    curve_data, run_dir,
+                    swa_start_epoch=curriculum_epochs,
+                    filename='train_val_curve.png')
+                print(f'[done] curve plot → {png}', flush=True)
+            except Exception as e:
+                print(f'[warn] plot failed: {e}', flush=True)
 
     if is_distributed():
         dist.barrier()
