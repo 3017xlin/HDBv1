@@ -1,0 +1,101 @@
+data:
+  cache_dir: ~/scratch/HDB_cache
+  manifest_path: ~/scratch/HDB_STAT/manifest.json
+  norm_stats_path: ~/scratch/HDB_cache/norm_stats.json
+  physical_pt_dir: ~/scratch/HDB
+
+training:
+  num_epochs: 400
+  num_workers: 30
+  lr: 1.0e-4
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  swa_start_epoch: 300
+  compile_mode: reduce-overhead
+  prefetch_queue_size: 4
+  train_eval_per_subbin: 4
+  n_query: 500000
+
+curriculum:
+  enabled: true
+  T_start: 3.0
+  T_end: 1.0
+  floor_ratio: 0.3
+  floor_min_abs: 3
+
+sampling:
+  surface_per_point_ratio: 2.0
+
+model:
+  latent_dim: 192
+  num_layers: 12
+  num_heads: 3
+  head_dim: 64
+  ffn_hidden: 768
+  register_tokens: 16
+  encoder_k: 32
+  encoder_q_in_dim: 46
+  encoder_kv_hidden: 64
+  bigbird_local: 64
+  bigbird_register: 16
+  bigbird_random: 32
+  decoder_idw_k: 8
+  decoder_fourier_freqs: 10
+  decoder_pos_hidden: 256
+  decoder_pos_out: 512
+  vol_out: 5
+  surf_out: 1
+  rope_base: 100.0
+  rope_dims: [22, 22, 20]
+  drop_path_rate: 0.0
+
+preprocessing:
+  coord_divisor: 550.0
+  sdf_bins: 15
+  sdf_base_width: 3.125
+  sdf_max_range: 1100.0
+  kmeans_alpha: 0.65
+  top_k_neighbors: 256
+  latent_knn: 64
+  pbd_bins: 16
+  pbd_scale: 50.0
+
+batch_sizes:
+  '0-19_easy': 4
+  '0-19_hard': 4
+  '20-39_easy': 4
+  '20-39_hard': 4
+  '40-59_easy': 2
+  '40-59_hard': 2
+  '60-79_easy': 2
+  '60-79_hard': 1
+  '80-123_easy': 1
+  '80-123_hard': 1
+
+sub_bin_L:
+  '0-19_easy': 8192
+  '0-19_hard': 16384
+  '20-39_easy': 24576
+  '20-39_hard': 32768
+  '40-59_easy': 40960
+  '40-59_hard': 49152
+  '60-79_easy': 57344
+  '60-79_hard': 65536
+  '80-123_easy': 73728
+  '80-123_hard': 81920
+
+physical_constants:
+  G_GRAVITY: 9.81
+  COORD_MAX: 550.0
+
+checkpoint:
+  save_dir: ~/scratch/HDB_ckpt
+  every_epochs_pre_swa: 10
+  every_epochs_swa: 5
+
+evaluation:
+  test_chunk_size: 4000000
+  slice_heights: [1.5, 5, 10, 20, 40, 80, 120]
+  slice_tolerances: [0.5, 0.5, 1.0, 1.0, 2.0, 2.0, 3.0]
+
+seed: 42
