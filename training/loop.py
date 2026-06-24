@@ -29,18 +29,18 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim import AdamW
 
-from hdb.dataset.loaders import load_cases_pinned
-from hdb.dataset.prefetcher import AsyncPrefetcher, prepare_one_case, stack_batch
-from hdb.models import HDB3DModel
-from hdb.models.bigbird import build_block_mask_direct
-from hdb.models.idw import gpu_idw
-from hdb.training.checkpoint import save_checkpoint, load_checkpoint
-from hdb.training.curriculum import CurriculumScheduler
-from hdb.training.ddp import init_ddp, cleanup_ddp, is_distributed
-from hdb.training.shard import build_grouped_shard, BATCH_SIZES
-from hdb.training.swa import SWAManager
-from hdb.utils.memory import cpu_rss_gib, gpu_peak_gib
-from hdb.utils.seed import seed_everything, per_case_epoch_seed
+from dataset.loaders import load_cases_pinned
+from dataset.prefetcher import AsyncPrefetcher, prepare_one_case, stack_batch
+from models import HDB3DModel
+from models.bigbird import build_block_mask_direct
+from models.idw import gpu_idw
+from training.checkpoint import save_checkpoint, load_checkpoint
+from training.curriculum import CurriculumScheduler
+from training.ddp import init_ddp, cleanup_ddp, is_distributed
+from training.shard import build_grouped_shard, BATCH_SIZES
+from training.swa import SWAManager
+from utils.memory import cpu_rss_gib, gpu_peak_gib
+from utils.seed import seed_everything, per_case_epoch_seed
 
 SUB_BIN_ORDER = [
     '0-19_easy', '0-19_hard', '20-39_easy', '20-39_hard',
@@ -507,7 +507,7 @@ def train(cfg: dict) -> None:
                           indent=2)
             print(f'[done] curve data → {curve_path}', flush=True)
             try:
-                from hdb.evaluation.viz import plot_train_val_curve
+                from evaluation.viz import plot_train_val_curve
                 png = plot_train_val_curve(
                     curve_data, run_dir,
                     swa_start_epoch=curriculum_epochs,

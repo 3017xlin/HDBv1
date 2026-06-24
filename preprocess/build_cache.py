@@ -5,10 +5,14 @@ Usage::
 
     python hdb/preprocess/build_cache.py --config hdb/config.yaml
 
-Flow:
-  1. Load config + manifest.json
-  2. Phase 0: Anomaly detection on all cases -> filter
-  3. Phase 1-4: Per-case processing (multiprocessing, ~40 workers)
+Flow (2 passes, intermediate disk hit once instead of three times):
+
+  Phase 0 (optional): Anomaly detection on all cases -> filter.
+                      Usually --skip-anomaly because build_manifest.py
+                      already ran the same MAD filter.
+
+  Pass 1  (Pool of N workers, one case per task)
+    For every case:
        a. Load physical PT
        b. SDF fix (negate volume_sdf, volume_sdf_grad)
        c. Coordinate normalisation (pos / 550)
@@ -16,20 +20,41 @@ Flow:
        e. Training transform: p_train = p_phys + 9.81 * z
        f. SDF binning + K-means -> centroids
        g. Neighbors: top256, top64
-       h. leaf_stats (21 dims, vectorized)
-       i. PBD computation
+       h. leaf_stats (21 dims, vectorised)
+       i. PBD
        j. Save intermediate PT (pre-zscore)
-  4. Welford pass: compute norm_stats from 700 train cases
-  5. Z-score pass: apply z-score to all 800 cases
-  6. Precompute pass: add 6 precomputed fields
-  7. RoPE scale computation
-  8. Save final cache PTs + norm_stats.json
+    For train cases ONLY the worker also emits (sum, sumsq, count) per
+    z-scored field and the case's centroids; main() streams these into
+    per-field accumulators + a centroid list.
+
+  Aggregate (single-threaded in main, no extra disk pass)
+    - norm_stats = (sum / n, sqrt(sumsq / n - mean^2)) per field
+    - rope_scales = compute_rope_scales(concat(train_centroids), L_map)
+    - save norm_stats.json (mean/std + rope_scales)
+
+  Pass 2  (Pool of N workers)
+    For every case: load intermediate PT -> apply_zscore ->
+    add_precomputed_fields(rope_scale[sub_bin]) -> save final cache PT.
+
+The old Phase 5 (Welford reload), Phase 6 (z-score reload+save) and
+Phase 7-pre (centroid reload) are gone; the only fan-out passes left
+are Pass 1 and Pass 2.
 """
 from __future__ import annotations
 
+import os
+
+# Pin BLAS / OpenMP / TBB to a single thread per process BEFORE numpy or
+# any other math library is imported.  We run with Pool(workers=80) so
+# each child must use exactly one thread, otherwise 80 × 80 threads
+# contend and the per-case work appears to hang.
+for _k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+           "NUMEXPR_NUM_THREADS", "TBB_NUM_THREADS",
+           "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_k, "1")
+
 import argparse
 import json
-import os
 import sys
 import time
 from functools import partial
@@ -42,22 +67,24 @@ import torch
 import yaml
 from tqdm import tqdm
 
-# Ensure project root on sys.path
-_PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
+torch.set_num_threads(1)
+
+# Ensure project root on sys.path so `from preprocess.X import Y`
+# resolves regardless of the project directory name.
+_PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from hdb.preprocess.anomaly_detect import compute_case_stats, detect_anomalies_mad
-from hdb.preprocess.curvature import compute_curvature
-from hdb.preprocess.leaf_stats import compute_leaf_stats_vectorized
-from hdb.preprocess.neighbors import compute_latent_neighbors, compute_top256
-from hdb.preprocess.pbd import compute_pbd
-from hdb.preprocess.precompute import add_precomputed_fields
-from hdb.preprocess.rope_scale import compute_rope_scales
-from hdb.preprocess.sdf_binning import build_sdf_bin_edges, weighted_kmeans_allocation
-from hdb.preprocess.zscore import (
+from preprocess.anomaly_detect import compute_case_stats, detect_anomalies_mad
+from preprocess.curvature import compute_curvature
+from preprocess.leaf_stats import compute_leaf_stats_vectorized
+from preprocess.neighbors import compute_latent_neighbors, compute_top256
+from preprocess.pbd import compute_pbd
+from preprocess.precompute import add_precomputed_fields
+from preprocess.rope_scale import compute_rope_scales
+from preprocess.sdf_binning import build_sdf_bin_edges, weighted_kmeans_allocation
+from preprocess.zscore import (
     apply_zscore,
-    compute_norm_stats,
     load_norm_stats,
     save_norm_stats,
 )
@@ -65,6 +92,15 @@ from hdb.preprocess.zscore import (
 # ── Physical constants ─────────────────────────────────────────────
 G_GRAVITY = 9.81  # Pa/m  (kinematic pressure detrend coefficient)
 COORD_DIVISOR = 550.0
+
+
+def _pool_worker_init() -> None:
+    """Pin every Pool child to single-threaded math libraries."""
+    for k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+              "NUMEXPR_NUM_THREADS", "TBB_NUM_THREADS",
+              "VECLIB_MAXIMUM_THREADS"):
+        os.environ[k] = "1"
+    torch.set_num_threads(1)
 
 
 # ── Config helpers ─────────────────────────────────────────────────
@@ -102,7 +138,7 @@ def run_anomaly_detection(
 ) -> dict[str, dict]:
     """Scan all physical PTs and return per-case anomaly results."""
     print(f"[Phase 0] Anomaly detection: scanning {len(all_case_paths)} cases ...")
-    with Pool(num_workers) as pool:
+    with Pool(num_workers, initializer=_pool_worker_init) as pool:
         cases_stats = list(
             tqdm(
                 pool.imap(_compute_stats_for_anomaly, all_case_paths),
@@ -305,71 +341,70 @@ def process_single_case(
     out_path = os.path.join(intermediate_dir, f"{case_name}.pt")
     torch.save(pt_out, out_path)
 
-    return case_name
+    # ── Streaming sufficient statistics for train cases ──
+    # Each worker emits per-case (sum, sumsq, count) per channel so the
+    # main process can compute norm_stats and rope_scales without a
+    # second 700-PT load pass (Welford was the old Phase 5).
+    is_train = bool(case_info.get("split") == "train")
+    suff: dict[str, tuple] | None = None
+    train_centroids_norm: np.ndarray | None = None
+    if is_train:
+        suff = {}
+        for name, arr in (
+            ("vol",       pt_out["point_y_volume"]),
+            ("surf",      pt_out["point_y_surface"]),
+            ("pt_sdf",    pt_out["point_sdf"]),
+            ("pt_sdfg",   pt_out["point_sdf_grad"]),
+            ("pt_cm",     pt_out["point_curvature_mean"]),
+            ("pt_cg",     pt_out["point_curvature_gauss"]),
+            ("leaf_sdf",  pt_out["leaf_sdf"]),
+            ("leaf_sdfg", pt_out["leaf_sdf_grad"]),
+            ("leaf_cm",   pt_out["leaf_curvature_mean"]),
+            ("leaf_cg",   pt_out["leaf_curvature_gauss"]),
+            ("leaf_stats",pt_out["leaf_stats"]),
+        ):
+            a = np.asarray(arr, dtype=np.float64)
+            if a.ndim == 1:
+                a = a[:, None]
+            n = int(a.shape[0])
+            s = a.sum(axis=0)
+            sq = (a * a).sum(axis=0)
+            suff[name] = (n, s, sq)
+        train_centroids_norm = pt_out["leaf_centroid_norm"].astype(np.float32)
+
+    return {
+        "case_name": case_name,
+        "sub_bin": sub_bin,
+        "split": case_info.get("split"),
+        "suff": suff,
+        "train_centroids_norm": train_centroids_norm,
+    }
 
 
 # ── Welford pass ───────────────────────────────────────────────────
 
 
-def run_welford_pass(
-    train_case_ids: list[str],
-    intermediate_dir: str,
-) -> dict:
-    """Compute z-score statistics from 700 train cases."""
-    print(f"[Phase 5] Welford pass: {len(train_case_ids)} train cases ...")
-
-    def load_fn(case_id):
-        path = os.path.join(intermediate_dir, f"{case_id}.pt")
-        return torch.load(path, map_location="cpu", weights_only=False)
-
-    norm_stats = compute_norm_stats(train_case_ids, load_fn)
-    return norm_stats
+# ── (Welford "Phase 5" removed: sufficient stats are streamed during
+#     Pass 1 and aggregated in main(), so no extra 700-PT load pass.) ──
 
 
-# ── Z-score pass ───────────────────────────────────────────────────
+# ── Pass 2: merged z-score + precompute ──────────────────────────────
 
 
-def _zscore_single_case(args):
-    """Apply z-score to a single intermediate PT and overwrite."""
-    case_name, intermediate_dir, norm_stats = args
-    path = os.path.join(intermediate_dir, f"{case_name}.pt")
-    pt = torch.load(path, map_location="cpu", weights_only=False)
+def _zscore_and_precompute_single_case(args):
+    """Pass 2 worker: load intermediate → z-score → precompute → save final.
+
+    Merges the previous Phase 6 (z-score) and Phase 7 (precompute) into
+    one load+save so each case only does one round-trip to disk.
+    """
+    case_name, intermediate_dir, cache_dir, norm_stats, rope_scales, cfg = args
+    in_path = os.path.join(intermediate_dir, f"{case_name}.pt")
+    pt = torch.load(in_path, map_location="cpu", weights_only=False)
+
     pt = apply_zscore(pt, norm_stats)
-    torch.save(pt, path)
-    return case_name
-
-
-def run_zscore_pass(
-    all_case_names: list[str],
-    intermediate_dir: str,
-    norm_stats: dict,
-    num_workers: int = 40,
-) -> None:
-    """Apply z-score normalisation to all 800 cases using train stats."""
-    print(f"[Phase 6] Z-score pass: {len(all_case_names)} cases ...")
-    args_list = [(cn, intermediate_dir, norm_stats) for cn in all_case_names]
-    with Pool(num_workers) as pool:
-        list(
-            tqdm(
-                pool.imap_unordered(_zscore_single_case, args_list),
-                total=len(all_case_names),
-                desc="Z-score",
-            )
-        )
-
-
-# ── Precompute pass ────────────────────────────────────────────────
-
-
-def _precompute_single_case(args):
-    """Add precomputed fields to a single (post-z-score) PT."""
-    case_name, intermediate_dir, cache_dir, rope_scales, cfg = args
-    path = os.path.join(intermediate_dir, f"{case_name}.pt")
-    pt = torch.load(path, map_location="cpu", weights_only=False)
 
     sub_bin = pt["sub_bin"]
     rope_scale = rope_scales[sub_bin]
-
     model_cfg = cfg.get("model", {})
     pt = add_precomputed_fields(
         pt,
@@ -381,36 +416,34 @@ def _precompute_single_case(args):
         register_tokens=model_cfg.get("register_tokens", 16),
     )
 
-    # Save to final cache directory
     out_path = os.path.join(cache_dir, f"{case_name}.pt")
     torch.save(pt, out_path)
     return case_name
 
 
-def run_precompute_pass(
+def run_pass2(
     all_case_names: list[str],
     intermediate_dir: str,
     cache_dir: str,
+    norm_stats: dict,
     rope_scales: dict[str, np.ndarray],
     cfg: dict,
-    num_workers: int = 40,
+    num_workers: int = 80,
 ) -> None:
-    """Add precomputed fields and write final cache PTs."""
-    print(f"[Phase 7] Precompute pass: {len(all_case_names)} cases ...")
+    """Pass 2: z-score + precompute in a single load/save per case."""
+    print(f"[Pass 2] z-score + precompute: {len(all_case_names)} cases "
+          f"with {num_workers} workers ...")
     args_list = [
-        (cn, intermediate_dir, cache_dir, rope_scales, cfg)
+        (cn, intermediate_dir, cache_dir, norm_stats, rope_scales, cfg)
         for cn in all_case_names
     ]
-    # Use sequential processing because precompute involves scipy/torch
-    # and some operations don't release the GIL well with multiprocessing
-    # For large datasets, consider reducing workers to avoid memory pressure
-    workers = min(num_workers, 20)  # cap to avoid memory issues
-    with Pool(workers) as pool:
+    with Pool(num_workers, initializer=_pool_worker_init) as pool:
         list(
             tqdm(
-                pool.imap_unordered(_precompute_single_case, args_list),
+                pool.imap_unordered(
+                    _zscore_and_precompute_single_case, args_list),
                 total=len(all_case_names),
-                desc="Precompute",
+                desc="Pass 2 (zscore+precompute)",
             )
         )
 
@@ -418,21 +451,9 @@ def run_precompute_pass(
 # ── RoPE scale computation ────────────────────────────────────────
 
 
-def compute_all_rope_scales(
-    train_case_names: list[str],
-    intermediate_dir: str,
-    sub_bin_L_map: dict[str, int],
-) -> dict[str, np.ndarray]:
-    """Collect all train centroids and compute per-sub-bin RoPE scales."""
-    print("[Phase 7-pre] Computing RoPE scales from train centroids ...")
-    all_centroids: list[np.ndarray] = []
-    for cn in tqdm(train_case_names, desc="Collecting centroids"):
-        path = os.path.join(intermediate_dir, f"{cn}.pt")
-        pt = torch.load(path, map_location="cpu", weights_only=False)
-        all_centroids.append(np.asarray(pt["leaf_centroid_norm"]))
-
-    all_train_centroids = np.concatenate(all_centroids, axis=0)
-    return compute_rope_scales(all_train_centroids, sub_bin_L_map)
+# ── (compute_all_rope_scales removed: train centroids are streamed
+#    from Pass 1 workers and concatenated in main(), so we skip the
+#    "load every train intermediate PT a second time" step.) ──
 
 
 # ── Main ───────────────────────────────────────────────────────────
@@ -520,8 +541,8 @@ def main():
         print(f"After filtering: {len(all_cases)} cases, "
               f"{len(train_case_names)} train")
 
-    # ── Phase 1-4: Per-case processing ──
-    print(f"\n[Phase 1-4] Processing {len(all_cases)} cases "
+    # ── Pass 1: per-case processing + streaming Welford + train centroids ──
+    print(f"\n[Pass 1] per-case processing on {len(all_cases)} cases "
           f"with {num_workers} workers ...")
     bin_edges = build_sdf_bin_edges()
     coord_divisor = cfg.get("preprocessing", {}).get(
@@ -539,49 +560,81 @@ def main():
         alpha=alpha,
     )
 
-    t0 = time.time()
-    with Pool(num_workers) as pool:
-        list(
-            tqdm(
-                pool.imap_unordered(process_fn, all_cases),
-                total=len(all_cases),
-                desc="Per-case processing",
-            )
-        )
-    print(f"  Phase 1-4 completed in {time.time() - t0:.1f}s")
+    # Streaming accumulators (sum / sum-of-squares / count per field)
+    field_sums: dict[str, np.ndarray] = {}
+    field_sqsums: dict[str, np.ndarray] = {}
+    field_counts: dict[str, int] = {}
+    train_centroids_chunks: list[np.ndarray] = []
 
-    # ── Phase 5: Welford pass ──
     t0 = time.time()
-    norm_stats = run_welford_pass(train_case_names, intermediate_dir)
+    with Pool(num_workers, initializer=_pool_worker_init) as pool:
+        for rec in tqdm(
+            pool.imap_unordered(process_fn, all_cases),
+            total=len(all_cases),
+            desc="Pass 1 (per-case)",
+        ):
+            suff = rec.get("suff") if isinstance(rec, dict) else None
+            if suff:
+                for name, (n, s, sq) in suff.items():
+                    if name in field_sums:
+                        field_sums[name] += s
+                        field_sqsums[name] += sq
+                        field_counts[name] += n
+                    else:
+                        field_sums[name] = s.astype(np.float64).copy()
+                        field_sqsums[name] = sq.astype(np.float64).copy()
+                        field_counts[name] = n
+            tc = rec.get("train_centroids_norm") if isinstance(rec, dict) else None
+            if tc is not None:
+                train_centroids_chunks.append(tc)
+    print(f"  Pass 1 completed in {time.time() - t0:.1f}s")
+
+    # ── Aggregate norm_stats from streaming sufficient stats ──
+    t0 = time.time()
+    norm_stats: dict = {}
+    for name, n in field_counts.items():
+        if n == 0:
+            continue
+        mean = field_sums[name] / n
+        var = field_sqsums[name] / n - mean ** 2
+        var = np.maximum(var, 0.0)
+        std = np.sqrt(var)
+        # Scalar-channel features collapse to a plain float to match the
+        # legacy load_norm_stats / apply_zscore contract.
+        if mean.shape[0] == 1:
+            norm_stats[f"{name}_mean"] = float(mean[0])
+            norm_stats[f"{name}_std"] = float(std[0])
+        else:
+            norm_stats[f"{name}_mean"] = mean.tolist()
+            norm_stats[f"{name}_std"] = std.tolist()
     norm_stats_path = os.path.join(cache_dir, "norm_stats.json")
     save_norm_stats(norm_stats, norm_stats_path)
-    print(f"  Welford pass completed in {time.time() - t0:.1f}s")
+    print(f"  norm_stats aggregated in {time.time() - t0:.1f}s "
+          f"(from streaming Welford, no extra disk pass)")
     print(f"  norm_stats saved to {norm_stats_path}")
 
-    # ── Phase 6: Z-score pass ──
+    # ── RoPE scales from streamed train centroids ──
     t0 = time.time()
-    run_zscore_pass(all_case_names, intermediate_dir, norm_stats, num_workers)
-    print(f"  Z-score pass completed in {time.time() - t0:.1f}s")
-
-    # ── Phase 7: RoPE scale + Precompute pass ──
-    t0 = time.time()
-    rope_scales = compute_all_rope_scales(
-        train_case_names, intermediate_dir, sub_bin_L
-    )
-    print(f"  RoPE scales computed in {time.time() - t0:.1f}s")
-
-    # Append rope_scales to norm_stats.json
+    if not train_centroids_chunks:
+        raise RuntimeError("no train centroids collected; cannot compute "
+                           "rope_scales")
+    all_train_centroids = np.concatenate(train_centroids_chunks, axis=0)
+    rope_scales = compute_rope_scales(all_train_centroids, sub_bin_L)
     norm_stats_full = load_norm_stats(norm_stats_path)
     norm_stats_full["rope_scales"] = {
         k: v.tolist() for k, v in rope_scales.items()
     }
     save_norm_stats(norm_stats_full, norm_stats_path)
+    print(f"  RoPE scales computed in {time.time() - t0:.1f}s "
+          f"(from streamed train centroids, no extra disk pass)")
 
+    # ── Pass 2: z-score + precompute, merged into a single load+save ──
     t0 = time.time()
-    run_precompute_pass(
-        all_case_names, intermediate_dir, cache_dir, rope_scales, cfg, num_workers
+    run_pass2(
+        all_case_names, intermediate_dir, cache_dir,
+        norm_stats, rope_scales, cfg, num_workers,
     )
-    print(f"  Precompute pass completed in {time.time() - t0:.1f}s")
+    print(f"  Pass 2 completed in {time.time() - t0:.1f}s")
 
     # ── Cleanup intermediate dir (optional) ──
     print(f"\n[Done] Cache built at: {cache_dir}")

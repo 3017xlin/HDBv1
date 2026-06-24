@@ -133,12 +133,21 @@ def weighted_kmeans_allocation(
                 extra_idx = rng.choice(n_pts, size=n_clusters - n_pts, replace=True)
                 centroids_b = np.vstack([centroids_b, pts[extra_idx]])
         else:
+            # KMeans is the dominant cost in Phase 1-4: n_clusters can be
+            # tens of thousands for the largest sub-bins.  n_init=3 means
+            # 3x the work for a marginal centroid-quality gain that the
+            # downstream model is insensitive to (it just needs evenly
+            # spaced anchors).  max_iter=100 is also overkill — MBKMeans
+            # converges in <30 iters on this kind of point cloud.  Drop
+            # to n_init=1, max_iter=30, raise tol so it terminates early
+            # whenever it can.
             kmeans = MiniBatchKMeans(
                 n_clusters=n_clusters,
                 batch_size=max(10000, n_clusters * 20),
-                max_iter=100,
+                max_iter=30,
                 random_state=42 + case_id * 1000 + b,
-                n_init=3,
+                n_init=1,
+                tol=1e-3,
             )
             kmeans.fit(pts)
             centroids_b = kmeans.cluster_centers_

@@ -87,7 +87,7 @@ def main():
             cfg[section][key] = str(Path(cfg[section][key]).expanduser().resolve())
 
     # ================================================================ DDP INIT
-    from hdb.training.ddp import init_ddp, cleanup_ddp, is_distributed
+    from training.ddp import init_ddp, cleanup_ddp, is_distributed
     rank, world, local = init_ddp()
     device = torch.device("cuda", local)
 
@@ -119,7 +119,7 @@ def main():
     log(rank, f"  Train cases: {len(all_train_ids)} total, {len(my_train_ids)} this rank")
     log(rank, f"  Val cases: {len(manifest['splits']['val'])} total, {len(my_val_ids)} this rank")
 
-    from hdb.dataset.loaders import load_cases_pinned
+    from dataset.loaders import load_cases_pinned
     num_workers = min(int(cfg["training"].get("num_workers", 30)), 8)
 
     t0 = time.time()
@@ -145,7 +145,7 @@ def main():
 
     # ================================================================ MODEL
     banner(rank, "Build Model + DDP + Compile", 3)
-    from hdb.models import HDB3DModel
+    from models import HDB3DModel
 
     model = HDB3DModel(cfg).to(device)
     total_params = sum(p.numel() for p in model.parameters())
@@ -176,8 +176,8 @@ def main():
 
     # ================================================================ PREFETCHER + 1 BATCH
     banner(rank, "Prefetcher: Build + Consume 1 Batch", 5)
-    from hdb.dataset.prefetcher import prepare_one_case, stack_batch, _trim_queries_to_nqv
-    from hdb.training.shard import build_grouped_shard, BATCH_SIZES, SUB_BIN_L
+    from dataset.prefetcher import prepare_one_case, stack_batch, _trim_queries_to_nqv
+    from training.shard import build_grouped_shard, BATCH_SIZES, SUB_BIN_L
 
     pick_sb = list(cases_per_bin.keys())[0]
     pick_ids = cases_per_bin[pick_sb][:BATCH_SIZES.get(pick_sb, 1)]
@@ -213,8 +213,8 @@ def main():
 
     # ================================================================ BIGBIRD + H2D + IDW
     banner(rank, "BigBird Mask + H2D + IDW", 6)
-    from hdb.models.bigbird import build_block_mask_direct
-    from hdb.models.idw import gpu_idw
+    from models.bigbird import build_block_mask_direct
+    from models.idw import gpu_idw
 
     torch.cuda.reset_peak_memory_stats(device)
 

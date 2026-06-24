@@ -112,7 +112,7 @@ def main() -> None:
     cfg = load_config(args.config)
 
     # --- DDP init ---
-    from hdb.training.ddp import init_ddp, cleanup_ddp
+    from training.ddp import init_ddp, cleanup_ddp
     rank, world, local = init_ddp()
     device = (torch.device("cuda", local) if torch.cuda.is_available()
               else torch.device("cpu"))
@@ -123,7 +123,7 @@ def main() -> None:
         t0 = time.time()
 
     # --- Load model ---
-    from hdb.models import HDB3DModel
+    from models import HDB3DModel
     model = HDB3DModel(cfg).to(device)
 
     sd = torch.load(args.checkpoint, map_location=device, weights_only=False)
@@ -150,14 +150,14 @@ def main() -> None:
         print(f"[evaluate] {len(test_ids)} test cases total, "
               f"{len(my_test_ids)} on this rank", flush=True)
 
-    from hdb.dataset.loaders import load_cases_pinned
+    from dataset.loaders import load_cases_pinned
     num_workers = min(int(cfg["training"].get("num_workers", 30)), 8)
     my_case_pts = load_cases_pinned(
         cfg["data"]["cache_dir"], my_test_ids,
         num_workers=num_workers, rank=rank)
 
     # --- Full-point test inference ---
-    from hdb.evaluation.test_eval import test_full_inference
+    from evaluation.test_eval import test_full_inference
     chunk_size = int(cfg.get("evaluation", {}).get("test_chunk_size", 4_000_000))
 
     result = test_full_inference(
@@ -186,7 +186,7 @@ def main() -> None:
         print(f"[evaluate] metrics saved to {metrics_path}", flush=True)
 
         # Generate visualizations
-        from hdb.evaluation.viz import generate_test_visualizations
+        from evaluation.viz import generate_test_visualizations
         viz_paths = generate_test_visualizations(result, output_dir, cfg)
         for p in viz_paths:
             print(f"[evaluate] saved viz: {p}", flush=True)
