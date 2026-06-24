@@ -14,7 +14,7 @@ import numpy as np
 import torch
 from scipy.spatial import cKDTree
 
-from hdb.models.rope import precompute_rope_3d
+from models.rope import precompute_rope_3d
 
 
 # ── Volume sample weight function ──────────────────────────────────
