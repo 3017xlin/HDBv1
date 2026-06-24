@@ -37,7 +37,7 @@ REQUIRED_PT_KEYS = [
 
 REQUIRED_PACKAGES = [
     "torch", "numpy", "scipy", "sklearn", "trimesh",
-    "open3d", "tqdm", "yaml",
+    "rtree", "open3d", "tqdm", "yaml",
 ]
 
 EXPECTED_CONFIG_KEYS = {
