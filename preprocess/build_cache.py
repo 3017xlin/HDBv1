@@ -125,6 +125,7 @@ def process_single_case(
     intermediate_dir: str,
     bin_edges: np.ndarray,
     coord_divisor: float,
+    alpha: float = 0.65,
 ) -> str:
     """Process one case: load physical PT, compute all features, save intermediate.
 
@@ -174,13 +175,14 @@ def process_single_case(
     # Keep original SDF for vol_log_sample_weight (pre-z-score)
     original_sdf_volume = volume_sdf.copy()
 
-    # ── Surface SDF: assign from nearest volume point ──
-    # Surface points don't have their own SDF in the PT — use volume SDF via NN
+    # ── Surface SDF: physically on building wall → SDF ≈ 0 ──
+    # Surface points sit on the building surface; their true SDF is 0.
+    # Grad at surface points: use nearest volume point's gradient as proxy.
     from scipy.spatial import cKDTree as _cKDTree
 
     vol_tree = _cKDTree(volume_pos)
     _, surf_nn_idx = vol_tree.query(surface_pos, k=1)
-    surface_sdf = volume_sdf[surf_nn_idx]
+    surface_sdf = np.zeros(N_surf, dtype=np.float32)
     surface_sdf_grad = volume_sdf_grad[surf_nn_idx]
 
     # ── Concatenate volume + surface ──
@@ -215,6 +217,7 @@ def process_single_case(
         bin_edges=bin_edges,
         L=L,
         case_id=case_id,
+        alpha=alpha,
     )
     centroids_norm = centroids / coord_divisor
 
@@ -523,12 +526,15 @@ def main():
         "coord_divisor", COORD_DIVISOR
     )
 
+    alpha = cfg.get("preprocessing", {}).get("kmeans_alpha", 0.65)
+
     process_fn = partial(
         process_single_case,
         raw_dir=raw_dir,
         intermediate_dir=intermediate_dir,
         bin_edges=bin_edges,
         coord_divisor=coord_divisor,
+        alpha=alpha,
     )
 
     t0 = time.time()

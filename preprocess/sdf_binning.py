@@ -88,6 +88,11 @@ def weighted_kmeans_allocation(
 
     alloc = (L * weighted_counts / total_wc).astype(np.int64)
 
+    # Ensure every populated bin gets at least 1 centroid
+    for b in range(n_bins):
+        if counts[b] > 0 and alloc[b] == 0:
+            alloc[b] = 1
+
     # Fix rounding to ensure sum == L
     diff = L - alloc.sum()
     for _ in range(abs(int(diff))):

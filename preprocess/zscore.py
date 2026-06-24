@@ -51,7 +51,7 @@ class WelfordAccumulator:
 
     @property
     def std(self) -> np.ndarray:
-        return np.sqrt(self.M2 / max(self.n - 1, 1))
+        return np.sqrt(self.M2 / max(self.n, 1))
 
     def to_dict(self) -> dict:
         """Return mean/std as plain lists for JSON serialisation."""

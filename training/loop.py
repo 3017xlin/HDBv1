@@ -407,17 +407,23 @@ def train(cfg: dict) -> None:
     cleanup_ddp()
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description='HDB training loop')
-    parser.add_argument('--config', type=str, required=True,
-                        help='Path to config.yaml')
-    parser.add_argument('--run-dir', type=str, default=None,
-                        help='Override run directory')
-    args = parser.parse_args()
+def main(cfg: dict | None = None, resume_path: str | None = None) -> None:
+    if cfg is None:
+        parser = argparse.ArgumentParser(description='HDB training loop')
+        parser.add_argument('--config', type=str, required=True,
+                            help='Path to config.yaml')
+        parser.add_argument('--run-dir', type=str, default=None,
+                            help='Override run directory')
+        parser.add_argument('--resume', type=str, default=None,
+                            help='Checkpoint to resume from')
+        args = parser.parse_args()
+        cfg = _load_config(args.config)
+        if args.run_dir is not None:
+            cfg['run_dir'] = args.run_dir
+        resume_path = args.resume
 
-    cfg = _load_config(args.config)
-    if args.run_dir is not None:
-        cfg['run_dir'] = args.run_dir
+    if resume_path is not None:
+        cfg['resume_checkpoint'] = resume_path
 
     train(cfg)
 

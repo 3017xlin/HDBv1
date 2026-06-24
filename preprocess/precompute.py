@@ -10,19 +10,11 @@ Fields:
 """
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import numpy as np
 import torch
 from scipy.spatial import cKDTree
 
-# Add project root so quadri imports work
-_PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
-
-from quadri.models.rope import precompute_rope_3d
+from hdb.models.rope import precompute_rope_3d
 
 
 # ── Volume sample weight function ──────────────────────────────────

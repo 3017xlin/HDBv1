@@ -8,6 +8,10 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 
+def _identity_collate(batch):
+    return batch[0]
+
+
 class _CachePTDataset(Dataset):
     def __init__(self, cache_dir: str, case_ids: list[str]):
         self.cache_dir = Path(cache_dir)
@@ -50,7 +54,7 @@ def load_cases_pinned(
         batch_size=1,
         num_workers=num_workers,
         shuffle=False,
-        collate_fn=lambda batch: batch[0],
+        collate_fn=_identity_collate,
         persistent_workers=False,
     )
 
