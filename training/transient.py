@@ -43,16 +43,15 @@ def build_transient2(pt: dict, epoch: int, n_query: int = 500_000) -> dict[str, 
     case_id = int(pt.get("_case_id", 0))
     rng = make_rng(per_case_epoch_seed(case_id, epoch) ^ 0xA5A5_A5A5)
 
-    n_query_vol_target = int(pt["n_query_vol"])
-    n_query_surf_target = int(pt["n_query_surf"])
-
     vol_reorder_idx = _np(pt["vol_reorder_idx"]).astype(np.int64)
     surf_reorder_idx = _np(pt["surf_reorder_idx"]).astype(np.int64)
     N_vol = vol_reorder_idx.shape[0]
     N_surf = surf_reorder_idx.shape[0]
 
-    n_qv = min(n_query_vol_target, N_vol)
-    n_qs = min(n_query_surf_target, N_surf)
+    # Compute vol/surf split from the passed n_query (2:1 surface ratio)
+    n_qs = min(N_surf, int(n_query * N_surf / (N_surf + N_vol / 2.0)))
+    n_qv = min(n_query - n_qs, N_vol)
+    n_qs = min(n_qs, N_surf)
 
     # Volume: Gumbel-top-k with precomputed log weights
     log_w = _np(pt["vol_log_sample_weight"]).astype(np.float64)

@@ -1,20 +1,20 @@
 data:
-  cache_dir: ~/scratch/HDB_cache
-  manifest_path: ~/scratch/HDB_STAT/manifest.json
-  norm_stats_path: ~/scratch/HDB_cache/norm_stats.json
+  cache_dir: ~/scratch/cacheHDB
+  manifest_path: ~/scratch/manifest.json
+  norm_stats_path: ~/scratch/cacheHDB/norm_stats.json
   physical_pt_dir: ~/scratch/HDB
 
 training:
-  num_epochs: 400
+  num_epochs: 500
+  curriculum_epochs: 400
   num_workers: 30
   lr: 1.0e-4
   weight_decay: 0.01
   max_grad_norm: 1.0
-  swa_start_epoch: 300
+  swa_window: 100
   compile_mode: reduce-overhead
   prefetch_queue_size: 4
-  train_eval_per_subbin: 4
-  n_query: 500000
+  n_query: 125000
 
 curriculum:
   enabled: true

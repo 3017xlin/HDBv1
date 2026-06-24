@@ -453,8 +453,10 @@ def main():
     # ── Resolve paths ──
     data_cfg = cfg.get("data", {})
     cache_dir = os.path.expanduser(data_cfg.get("cache_dir", "~/scratch/HDB_cache"))
-    raw_dir = os.path.expanduser(data_cfg.get("raw_dir", "~/scratch/HDB_raw"))
-    manifest_path = data_cfg.get("manifest_path", os.path.join(raw_dir, "manifest.json"))
+    raw_dir = os.path.expanduser(data_cfg.get("physical_pt_dir", "~/scratch/HDB"))
+    manifest_path = os.path.expanduser(
+        data_cfg.get("manifest_path", os.path.join(raw_dir, "manifest.json"))
+    )
     intermediate_dir = os.path.join(cache_dir, "_intermediate")
     os.makedirs(cache_dir, exist_ok=True)
     os.makedirs(intermediate_dir, exist_ok=True)

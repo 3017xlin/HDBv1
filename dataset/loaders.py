@@ -28,7 +28,7 @@ class _CachePTDataset(Dataset):
             weights_only=False,
         )
         for k, v in pt.items():
-            if isinstance(v, torch.Tensor):
+            if isinstance(v, torch.Tensor) and k != "encoder_pool":
                 pt[k] = v.pin_memory()
         pt["_case_id"] = cid
         return cid, pt

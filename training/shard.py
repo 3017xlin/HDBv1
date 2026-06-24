@@ -60,5 +60,8 @@ def build_grouped_shard(
                 chunk = chunk + [ids_shuffled[0]] * (B - len(chunk))
             batches.append((chunk, sb, L, B))
 
-    rng.shuffle(batches)
+    if epoch == 0:
+        batches.sort(key=lambda t: t[2])
+    else:
+        rng.shuffle(batches)
     return batches
