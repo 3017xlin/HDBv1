@@ -22,6 +22,7 @@ import json
 import math
 import os
 import time
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -181,7 +182,11 @@ def train(cfg: dict) -> None:
         print(f'[init] world={world}, total_epochs={total_epochs}', flush=True)
 
     # ------------------------------------------------------------------ data
-    manifest_path = os.path.join(cache_dir, 'manifest.json')
+    manifest_path = cfg.get('data', {}).get('manifest_path')
+    if manifest_path:
+        manifest_path = str(Path(manifest_path).expanduser().resolve())
+    else:
+        manifest_path = os.path.join(cache_dir, 'manifest.json')
     with open(manifest_path) as f:
         manifest = json.load(f)
 

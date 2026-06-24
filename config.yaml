@@ -1,7 +1,7 @@
 data:
-  cache_dir: ~/scratch/HDB_cache
-  manifest_path: ~/scratch/HDB_STAT/manifest.json
-  norm_stats_path: ~/scratch/HDB_cache/norm_stats.json
+  cache_dir: ~/scratch/cacheHDB
+  manifest_path: ~/scratch/manifest.json
+  norm_stats_path: ~/scratch/cacheHDB/norm_stats.json
   physical_pt_dir: ~/scratch/HDB
 
 training:
