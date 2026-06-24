@@ -214,12 +214,9 @@ def train(cfg: dict) -> None:
         cache_dir, my_val_ids,
         num_workers=int(cfg['training'].get('num_workers', 30)))
 
-    train_eval_ids = manifest.get('train_eval', [])
-    my_train_eval_ids = [cid for cid in train_eval_ids if cid in all_pt_data]
-
     if rank == 0:
         print(f'[data] train={len(my_train_ids)} val={len(my_val_ids)} '
-              f'train_eval={len(my_train_eval_ids)} (this rank)', flush=True)
+              f'(this rank)', flush=True)
 
     # ----------------------------------------------------------------- model
     model = HDB3DModel(cfg).to(device)
@@ -357,8 +354,6 @@ def train(cfg: dict) -> None:
         # ================================================= EVAL CURVES
         val_loss = evaluate_split(
             compiled, val_pt_data, my_val_ids, epoch, device)
-        train_eval_loss = evaluate_split(
-            compiled, all_pt_data, my_train_eval_ids, epoch, device)
 
         # ======================================================== SWA
         swa.accumulate(model, epoch)
@@ -372,7 +367,7 @@ def train(cfg: dict) -> None:
             print(
                 f'[epoch {epoch:03d}] '
                 f'loss={avg_total:.5f} (vol={avg_vol:.5f} surf={avg_surf:.5f}) '
-                f'val={val_loss:.5f} trn_eval={train_eval_loss:.5f} '
+                f'val={val_loss:.5f} '
                 f'lr={sched.get_last_lr()[0]:.3e} T={T_curr:.2f} '
                 f'steps={n_steps} '
                 f'gpu={gpu_peak_gib(local):.1f}GiB '
