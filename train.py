@@ -31,6 +31,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resume", type=str, default=None,
         help="Path to checkpoint to resume from")
+    parser.add_argument(
+        "--lr", type=float, default=None,
+        help="Override training.lr from config")
+    parser.add_argument(
+        "--run-dir", type=str, default=None,
+        help="Override run_dir (where checkpoints + curves are written)")
     return parser.parse_args()
 
 
@@ -58,6 +64,11 @@ def load_config(config_path: str) -> dict:
 def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
+
+    if args.lr is not None:
+        cfg.setdefault("training", {})["lr"] = float(args.lr)
+    if args.run_dir is not None:
+        cfg["run_dir"] = args.run_dir
 
     # Lazy import to keep startup fast and avoid loading torch before
     # torchrun has set up environment variables.
