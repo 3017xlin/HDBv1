@@ -284,7 +284,7 @@ def train(cfg: dict) -> None:
         prefetcher = AsyncPrefetcher(
             batches, all_pt_data, epoch,
             encoder_k=int(cfg['model'].get('encoder_k', 32)),
-            n_query=int(cfg['sampling'].get('N_query', 500_000)),
+            n_query=int(cfg['training'].get('n_query', 125_000)),
             queue_size=int(cfg['training'].get('prefetch_queue_size', 4)),
         )
 

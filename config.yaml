@@ -14,7 +14,7 @@ training:
   compile_mode: reduce-overhead
   prefetch_queue_size: 4
   train_eval_per_subbin: 4
-  n_query: 500000
+  n_query: 125000
 
 curriculum:
   enabled: true
