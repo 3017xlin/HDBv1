@@ -270,7 +270,13 @@ def train(cfg: dict) -> None:
                     print(f'  {sb}: {len(cases_per_bin[sb])} (this rank)',
                           flush=True)
 
-    val_ids = manifest['splits']['val']
+    val_entries = manifest['splits']['val']
+    val_ids: list[str] = []
+    for entry in val_entries:
+        if isinstance(entry, dict):
+            val_ids.append(entry['case_name'])
+        else:
+            val_ids.append(str(entry))
     my_val_ids = sorted(val_ids[rank::world])
     if rank == 0:
         print(f'[data] loading {len(my_val_ids)} val cases ...', flush=True)

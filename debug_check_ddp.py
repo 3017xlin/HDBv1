@@ -112,12 +112,16 @@ def main():
     with open(manifest_path) as f:
         manifest = json.load(f)
 
-    all_train_ids = manifest["splits"]["train"]
+    def _name(e):
+        return e["case_name"] if isinstance(e, dict) else str(e)
+
+    all_train_ids = [_name(e) for e in manifest["splits"]["train"]]
+    val_ids = [_name(e) for e in manifest["splits"]["val"]]
     my_train_ids = sorted(all_train_ids[rank::world])
-    my_val_ids = sorted(manifest["splits"]["val"][rank::world])
+    my_val_ids = sorted(val_ids[rank::world])
 
     log(rank, f"  Train cases: {len(all_train_ids)} total, {len(my_train_ids)} this rank")
-    log(rank, f"  Val cases: {len(manifest['splits']['val'])} total, {len(my_val_ids)} this rank")
+    log(rank, f"  Val cases: {len(val_ids)} total, {len(my_val_ids)} this rank")
 
     from dataset.loaders import load_cases_pinned
     num_workers = min(int(cfg["training"].get("num_workers", 30)), 8)
