@@ -35,6 +35,48 @@ REQUIRED_PT_KEYS = [
     "stl_vertices", "stl_faces",
 ]
 
+# Keys that must be present in a post-precompute cache PT (after Pass 2
+# of preprocess/build_cache.py: z-score + precompute).
+REQUIRED_CACHE_PT_KEYS = [
+    # Leaf-level
+    "leaf_centroid_norm", "leaf_stats", "leaf_sdf", "leaf_sdf_grad",
+    "leaf_curvature_mean", "leaf_curvature_gauss", "leaf_pbd", "leaf_bin_id",
+    # Neighbor indices
+    "latent_point_top256", "latent_neighbor_top64",
+    # Point-level
+    "point_pos_norm", "point_sdf", "point_sdf_grad",
+    "point_curvature_mean", "point_curvature_gauss", "point_is_surface",
+    "point_leaf_id",
+    # Targets
+    "point_y_volume", "point_y_surface",
+    "vol_reorder_idx", "surf_reorder_idx",
+    # Precomputed (added by add_precomputed_fields)
+    "encoder_pool", "vol_log_sample_weight",
+    "rope_cos", "rope_sin", "bigbird_fixed",
+    "n_query_vol", "n_query_surf",
+    # Meta
+    "case_name", "sub_bin", "L",
+]
+
+# Fields that should be ~N(0,1) after z-score (sanity check post-preprocess).
+ZSCORED_FIELDS_TO_CHECK = [
+    "point_y_volume", "point_y_surface",
+    "leaf_stats", "leaf_sdf", "leaf_sdf_grad",
+]
+
+# norm_stats.json must contain mean+std for each accumulator name.
+REQUIRED_NORM_STAT_NAMES = [
+    "vol", "surf",
+    "pt_sdf", "pt_sdfg", "pt_cm", "pt_cg",
+    "leaf_sdf", "leaf_sdfg", "leaf_cm", "leaf_cg", "leaf_stats",
+]
+
+SUB_BIN_ORDER = [
+    "0-19_easy", "0-19_hard", "20-39_easy", "20-39_hard",
+    "40-59_easy", "40-59_hard", "60-79_easy", "60-79_hard",
+    "80-123_easy", "80-123_hard",
+]
+
 REQUIRED_PACKAGES = [
     "torch", "numpy", "scipy", "sklearn", "trimesh",
     "rtree", "open3d", "tqdm", "yaml",
@@ -256,6 +298,210 @@ def step_disk_space(cache_dir: str, raw_total_bytes: int) -> None:
         ok("free space looks sufficient")
 
 
+# ─── post-preprocess steps ──────────────────────────────────────────
+
+def step_manifest_structure(cfg: dict) -> dict | None:
+    heading("POST STEP A — manifest.json structure")
+    manifest_path = os.path.expanduser(
+        cfg.get("data", {}).get("manifest_path", "~/scratch/manifest.json"))
+    manifest_path = str(Path(manifest_path).resolve())
+    if not os.path.exists(manifest_path):
+        fail(f"manifest does not exist: {manifest_path}  "
+             f"(run build_manifest.py first)")
+        return None
+    try:
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+    except Exception as e:
+        fail(f"manifest JSON parse error: {e}")
+        return None
+
+    splits = manifest.get("splits")
+    if not isinstance(splits, dict):
+        fail(f"manifest.splits is not a dict: {type(splits).__name__}")
+        return None
+
+    for split in ("train", "val", "test"):
+        if split not in splits:
+            fail(f"manifest.splits.{split} missing")
+            continue
+        entries = splits[split]
+        if not isinstance(entries, list):
+            fail(f"manifest.splits.{split} is not a list "
+                 f"({type(entries).__name__})")
+            continue
+        # Check first entry shape — catches "list of dicts but missing
+        # case_name" (would break the training loop) and "list of bare
+        # strings" (old format) alike.
+        if entries:
+            e = entries[0]
+            if isinstance(e, dict):
+                if "case_name" not in e:
+                    fail(f"manifest.splits.{split}[0] is dict but has no "
+                         f"'case_name' field; keys = {sorted(e.keys())}")
+                else:
+                    ok(f"{split}: {len(entries)} entries (dict format)")
+            elif isinstance(e, str):
+                ok(f"{split}: {len(entries)} entries (string format)")
+            else:
+                fail(f"manifest.splits.{split}[0] has unexpected type "
+                     f"{type(e).__name__}")
+        else:
+            warn(f"{split}: empty list")
+
+    # Cross-check physical_pt_dir consistency.
+    cfg_phys = os.path.expanduser(
+        cfg.get("data", {}).get("physical_pt_dir", ""))
+    cfg_phys = str(Path(cfg_phys).resolve()) if cfg_phys else ""
+    man_phys = manifest.get("physical_pt_dir", "")
+    if cfg_phys and man_phys and cfg_phys != man_phys:
+        warn(f"manifest.physical_pt_dir={man_phys} differs from "
+             f"cfg.data.physical_pt_dir={cfg_phys}")
+    print(f"    manifest path: {manifest_path}")
+    print(f"    physical_pt_dir (manifest): {man_phys}")
+    return manifest
+
+
+def step_cache_files_exist(cfg: dict, manifest: dict) -> list[tuple[str, str]]:
+    heading("POST STEP B — cache PTs exist for every manifest entry")
+    cache_dir = os.path.expanduser(
+        cfg.get("data", {}).get("cache_dir", "~/scratch/cacheHDB"))
+    cache_dir = str(Path(cache_dir).resolve())
+    if not os.path.isdir(cache_dir):
+        fail(f"cache_dir does not exist: {cache_dir}")
+        return []
+
+    samples: list[tuple[str, str]] = []   # (split, case_name) — one per split
+    missing: dict[str, list[str]] = {"train": [], "val": [], "test": []}
+    for split, entries in manifest.get("splits", {}).items():
+        if split not in missing:
+            missing[split] = []
+        for e in entries:
+            cn = e["case_name"] if isinstance(e, dict) else str(e)
+            p = os.path.join(cache_dir, f"{cn}.pt")
+            if not os.path.exists(p):
+                missing[split].append(cn)
+        present = len(entries) - len(missing.get(split, []))
+        total = len(entries)
+        if missing.get(split):
+            fail(f"{split}: {present}/{total} cache PTs present "
+                 f"(missing {len(missing[split])})")
+            for cn in missing[split][:5]:
+                print(f"      missing: {cn}.pt")
+            if len(missing[split]) > 5:
+                print(f"      ... and {len(missing[split]) - 5} more")
+        else:
+            ok(f"{split}: all {total} cache PTs present")
+            if entries:
+                e0 = entries[0]
+                cn = e0["case_name"] if isinstance(e0, dict) else str(e0)
+                samples.append((split, cn))
+    print(f"    cache_dir: {cache_dir}")
+    return samples
+
+
+def step_cache_pt_schema(cfg: dict, samples: list[tuple[str, str]]) -> None:
+    heading("POST STEP C — cache PT schema + z-score sanity")
+    if not samples:
+        warn("no cache PT samples to load (cache empty?)")
+        return
+    try:
+        import torch
+        import numpy as np
+    except ImportError as e:
+        fail(f"torch / numpy unavailable: {e}")
+        return
+
+    cache_dir = os.path.expanduser(
+        cfg.get("data", {}).get("cache_dir", "~/scratch/cacheHDB"))
+    cache_dir = str(Path(cache_dir).resolve())
+
+    for split, cn in samples:
+        path = os.path.join(cache_dir, f"{cn}.pt")
+        try:
+            pt = torch.load(path, map_location="cpu", weights_only=False)
+        except Exception as e:
+            fail(f"{split} sample '{cn}.pt' load failed: {e}")
+            continue
+        missing = [k for k in REQUIRED_CACHE_PT_KEYS if k not in pt]
+        if missing:
+            fail(f"{split} '{cn}.pt' missing keys: {missing}")
+        else:
+            ok(f"{split} '{cn}.pt' has all {len(REQUIRED_CACHE_PT_KEYS)} "
+               f"required keys")
+
+        # Reject the leftover pre-zscore key — it should be deleted in
+        # Pass 2.
+        if "original_sdf_volume" in pt:
+            warn(f"{split} '{cn}.pt' still has 'original_sdf_volume' "
+                 f"(Pass 2 should have removed it)")
+
+        # Z-score sanity: each field should be roughly ~N(0,1).
+        for k in ZSCORED_FIELDS_TO_CHECK:
+            if k not in pt:
+                continue
+            v = pt[k]
+            if hasattr(v, "numpy"):
+                v = v.numpy()
+            v = np.asarray(v, dtype=np.float64)
+            if v.size == 0:
+                continue
+            m = float(v.mean())
+            s = float(v.std())
+            tag = ""
+            if abs(m) > 2.0 or s < 0.1 or s > 5.0:
+                tag = f"  ⚠ outside expected ~N(0,1) range"
+                _warnings_inc()
+            print(f"    {split} '{cn}' {k:24s}: mean={m:+.3f}  std={s:+.3f}"
+                  f"{tag}")
+
+
+def _warnings_inc():
+    """Bump warnings counter without printing a separate WARN line."""
+    global _warnings
+    _warnings += 1
+
+
+def step_norm_stats(cfg: dict) -> None:
+    heading("POST STEP D — norm_stats.json + rope_scales")
+    cache_dir = os.path.expanduser(
+        cfg.get("data", {}).get("cache_dir", "~/scratch/cacheHDB"))
+    ns_path = os.path.expanduser(
+        cfg.get("data", {}).get(
+            "norm_stats_path",
+            os.path.join(cache_dir, "norm_stats.json")))
+    ns_path = str(Path(ns_path).resolve())
+    if not os.path.exists(ns_path):
+        fail(f"norm_stats.json not found: {ns_path}")
+        return
+    try:
+        with open(ns_path) as f:
+            ns = json.load(f)
+    except Exception as e:
+        fail(f"norm_stats.json parse error: {e}")
+        return
+
+    missing = []
+    for name in REQUIRED_NORM_STAT_NAMES:
+        if f"{name}_mean" not in ns or f"{name}_std" not in ns:
+            missing.append(name)
+    if missing:
+        fail(f"norm_stats missing mean/std for: {missing}")
+    else:
+        ok(f"all {len(REQUIRED_NORM_STAT_NAMES)} accumulator stats present")
+
+    rs = ns.get("rope_scales")
+    if not isinstance(rs, dict):
+        fail("norm_stats.rope_scales missing or not a dict")
+    else:
+        missing_sb = [sb for sb in SUB_BIN_ORDER if sb not in rs]
+        if missing_sb:
+            fail(f"rope_scales missing sub-bins: {missing_sb}")
+        else:
+            ok(f"rope_scales present for all 10 sub-bins")
+    print(f"    norm_stats path: {ns_path}")
+
+
 def step_gpu() -> None:
     heading("STEP 7 — GPU check (optional)")
     try:
@@ -281,6 +527,13 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--config", required=True, help="Path to config.yaml")
+    p.add_argument("--stage", choices=["pre", "post", "all"], default="pre",
+                   help="`pre`: checks needed BEFORE build_manifest/build_cache "
+                        "(config, deps, raw PTs, dirs, disk). "
+                        "`post`: checks needed AFTER build_cache, BEFORE "
+                        "training (manifest format, cache PTs, schema, "
+                        "norm_stats, rope_scales). "
+                        "`all`: run both. Default: pre.")
     p.add_argument("--physical-pt-dir", default=None,
                    help="Override cfg.data.physical_pt_dir for this check.")
     p.add_argument("--check-gpu", action="store_true",
@@ -292,12 +545,21 @@ def main() -> int:
         print("\nABORT: cannot continue without a valid config.")
         return 1
 
-    step_imports()
-    raw_dir, pt_paths = step_physical_pt_dir(cfg, args.physical_pt_dir)
-    step_sample_pt(pt_paths)
-    cache_dir = step_writable_dirs(cfg)
-    raw_total = sum(os.path.getsize(p) for p in pt_paths) if pt_paths else 0
-    step_disk_space(cache_dir, raw_total)
+    if args.stage in ("pre", "all"):
+        step_imports()
+        raw_dir, pt_paths = step_physical_pt_dir(cfg, args.physical_pt_dir)
+        step_sample_pt(pt_paths)
+        cache_dir = step_writable_dirs(cfg)
+        raw_total = sum(os.path.getsize(p) for p in pt_paths) if pt_paths else 0
+        step_disk_space(cache_dir, raw_total)
+
+    if args.stage in ("post", "all"):
+        manifest = step_manifest_structure(cfg)
+        if manifest is not None:
+            samples = step_cache_files_exist(cfg, manifest)
+            step_cache_pt_schema(cfg, samples)
+            step_norm_stats(cfg)
+
     if args.check_gpu:
         step_gpu()
 
@@ -305,14 +567,24 @@ def main() -> int:
     print(f"  failures: {_failures}")
     print(f"  warnings: {_warnings}")
     if _failures:
-        print("\n  DIAGNOSTIC FAILED — fix the [FAIL] items above before "
-              "running build_manifest.py.")
+        if args.stage == "pre":
+            print("\n  DIAGNOSTIC FAILED — fix the [FAIL] items above before "
+                  "running build_manifest.py.")
+        else:
+            print("\n  DIAGNOSTIC FAILED — fix the [FAIL] items above before "
+                  "starting training.")
         return 1
     if _warnings:
         print("\n  diagnostic passed with warnings.")
         return 2
-    print("\n  diagnostic passed cleanly. "
-          "Next: python build_manifest.py --config config.yaml")
+    if args.stage == "pre":
+        print("\n  diagnostic passed cleanly. "
+              "Next: python build_manifest.py --config config.yaml")
+    elif args.stage == "post":
+        print("\n  diagnostic passed cleanly. "
+              "Next: python debug_train_dryrun.py --config config.yaml")
+    else:
+        print("\n  diagnostic passed cleanly. Ready to train.")
     return 0
 
 
