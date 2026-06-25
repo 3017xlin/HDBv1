@@ -70,6 +70,16 @@ def _build_optimizer_and_scheduler(
     model: torch.nn.Module, cfg: dict, world: int,
     steps_per_epoch_est: int,
 ) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR]:
+    """Build AdamW + warmup-cosine LambdaLR.
+
+    The optimizer is initialised at ``base_lr * sqrt(world * B_ref)``
+    (B_ref = 4 per the DrivAerML default); the schedule then anneals
+    that.  Because we use variable per-sub-bin batch sizes (1 / 2 / 4),
+    the training step additionally multiplies the schedule's LR by
+    ``sqrt(B_current / B_ref)`` so each step uses an LR proportional to
+    ``sqrt(effective_batch)`` — the standard adaptive-optimiser scaling
+    rule.  See the call site in :func:`train` for the per-step mutation.
+    """
     base_lr = float(cfg['training']['lr'])
     wd = float(cfg['training']['weight_decay'])
     effective_lr = base_lr * math.sqrt(world * 4)
@@ -411,6 +421,8 @@ def train(cfg: dict) -> None:
 
         epoch_loss_vol = 0.0
         epoch_loss_surf = 0.0
+        epoch_lr_sum = 0.0           # sum of actual per-step LR (after sqrt-B scaling)
+        epoch_lr_n = 0
         n_steps = 0
         t_epoch = time.time()
 
@@ -460,6 +472,24 @@ def train(cfg: dict) -> None:
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(),
                 float(cfg['training'].get('max_grad_norm', 1.0)))
+
+            # Per-step LR scaling by sqrt(B_current / B_ref).  The
+            # scheduler set opt.param_groups[0]['lr'] to its idealised
+            # value for an effective batch of world * 4 (= B_ref); the
+            # current batch has B = BATCH_SIZES[sub_bin], so its
+            # optimal LR is the scheduler's value × sqrt(B / 4).
+            # LambdaLR computes the next sched LR from its stored
+            # base_lrs (not from pg['lr']), so this mutation is local
+            # to this step.
+            B_current = BATCH_SIZES.get(
+                batch_cpu.get('sub_bin'), 1)
+            sched_lr = float(opt.param_groups[0]['lr'])
+            b_ratio = math.sqrt(B_current / 4.0)
+            for pg in opt.param_groups:
+                pg['lr'] = sched_lr * b_ratio
+            epoch_lr_sum += sched_lr * b_ratio
+            epoch_lr_n += 1
+
             opt.step()
             opt.zero_grad(set_to_none=True)
             sched.step()
@@ -489,13 +519,15 @@ def train(cfg: dict) -> None:
         # ====================================================== LOG
         if rank == 0:
             avg_total = avg_vol + avg_surf
+            avg_lr_eff = epoch_lr_sum / max(epoch_lr_n, 1)  # actual per-step LR avg
+            sched_lr = sched.get_last_lr()[0]
             if is_phase2:
                 print(
                     f'[epoch {epoch:03d} P2] '
                     f'loss={avg_total:.5f} (vol={avg_vol:.5f} surf={avg_surf:.5f}) '
                     f'val={val_metrics["total_mse"]:.5f} '
                     f'(v={val_metrics["vol_mse"]:.5f} s={val_metrics["surf_mse"]:.5f}) '
-                    f'lr={sched.get_last_lr()[0]:.3e} '
+                    f'lr_sched={sched_lr:.3e} lr_eff={avg_lr_eff:.3e} '
                     f'steps={n_steps} '
                     f'gpu={gpu_peak_gib(local):.1f}GiB '
                     f'cpu={cpu_rss_gib():.1f}GiB '
@@ -507,7 +539,8 @@ def train(cfg: dict) -> None:
                 print(
                     f'[epoch {epoch:03d} P1] '
                     f'loss={avg_total:.5f} (vol={avg_vol:.5f} surf={avg_surf:.5f}) '
-                    f'lr={sched.get_last_lr()[0]:.3e} T={T_curr:.2f} '
+                    f'lr_sched={sched_lr:.3e} lr_eff={avg_lr_eff:.3e} '
+                    f'T={T_curr:.2f} '
                     f'steps={n_steps} '
                     f'gpu={gpu_peak_gib(local):.1f}GiB '
                     f't={time.time() - t_epoch:.1f}s',
