@@ -119,6 +119,19 @@ def main():
             n = sum(p.numel() for p in module.parameters())
             print(f"    {name:12s}: {n:>12,} params")
 
+        # torch.compile is required so FlexAttention uses the Triton
+        # sparse kernel; without compile it falls back to sdpa_dense,
+        # which materialises a full (B,H,T,T) score matrix and OOMs at
+        # L=32k+.
+        compile_mode = cfg.get("training", {}).get(
+            "compile_mode", "reduce-overhead")
+        try:
+            model = torch.compile(model, mode=compile_mode, fullgraph=False)
+            print(f"  torch.compile(mode='{compile_mode}') wrapped")
+        except Exception as ce:
+            print(f"  WARN: torch.compile failed ({ce}); falling back to eager "
+                  f"(forward will likely OOM on big-L cases)")
+
         print(f"  PASS")
     except Exception as e:
         print(f"  FAIL: {e}")
