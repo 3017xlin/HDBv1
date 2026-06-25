@@ -25,7 +25,10 @@ def build_transient1(pt: dict, epoch: int, encoder_k: int = 32) -> np.ndarray:
 
     Returns (L, encoder_k, 10) float32.
     """
-    case_id = int(pt.get("_case_id", 0))
+    # per_case_epoch_seed hashes f"{case_id}:{epoch}" so case_id can be
+    # any str-able value (int from a legacy index-based identifier, or
+    # the str case_name we use today).  No int() cast.
+    case_id = pt.get("_case_id", 0)
     rng = make_rng(per_case_epoch_seed(case_id, epoch))
     L = int(pt["L"])
     pool = _np(pt["encoder_pool"])  # (L, 256, 10)
@@ -56,7 +59,7 @@ def build_transient2(pt: dict, epoch: int, n_query: int = 500_000) -> dict[str, 
     full-length ``[n_query, *]`` arrays; valid rows are filled with the
     real targets, padding rows are zero.
     """
-    case_id = int(pt.get("_case_id", 0))
+    case_id = pt.get("_case_id", 0)  # str or int, hashed by per_case_epoch_seed
     rng = make_rng(per_case_epoch_seed(case_id, epoch) ^ 0xA5A5_A5A5)
 
     vol_reorder_idx = _np(pt["vol_reorder_idx"]).astype(np.int64)
