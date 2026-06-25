@@ -60,17 +60,23 @@ class Decoder(nn.Module):
                 query_pos_norm: torch.Tensor, query_sdf: torch.Tensor,
                 query_sdf_grad: torch.Tensor,
                 idw_indices: torch.Tensor, idw_weights: torch.Tensor,
-                n_query_vol: int) -> tuple[torch.Tensor, torch.Tensor]:
+                ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         enc_feat, vit_feat: (B, L, dim)
-        query_pos_norm:     (B, N_q, 3)
+        query_pos_norm:     (B, N_q, 3)   N_q is the SAME (= cfg.training.n_query)
+                                          for every case in the batch.  Volume,
+                                          surface, and padding slots are
+                                          distinguished by the caller's
+                                          `query_is_surf` / `query_valid_mask`
+                                          and applied via the loss, not here.
         query_sdf:          (B, N_q)
         query_sdf_grad:     (B, N_q, 3)
         idw_indices:        (B, N_q, idw_k) int32 leaf ids
         idw_weights:        (B, N_q, idw_k) fp32
-        n_query_vol:        int -- split point between volume and surface queries
 
-        Returns (pred_vol [B, N_vol, 5], pred_surf [B, N_surf, 1]).
+        Returns (pred_vol [B, N_q, 5], pred_surf [B, N_q, 1]).
+        Both heads predict on every slot; only the relevant slots feed
+        the loss (the other head's prediction at that slot is discarded).
         """
         B, L, D = enc_feat.shape
         N_q = query_pos_norm.shape[1]
@@ -99,6 +105,6 @@ class Decoder(nn.Module):
         g2, b2 = self.film_vit(vit_interp).chunk(2, dim=-1)
         pos = pos * (1.0 + g2) + b2
 
-        pred_vol = self.volume_head(pos[:, :n_query_vol])                  # (B, N_vol, 5)
-        pred_surf = self.surface_head(pos[:, n_query_vol:])                # (B, N_surf, 1)
+        pred_vol = self.volume_head(pos)                                   # (B, N_q, 5)
+        pred_surf = self.surface_head(pos)                                 # (B, N_q, 1)
         return pred_vol, pred_surf

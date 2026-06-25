@@ -234,33 +234,32 @@ def _eval_one_case(model, pt: dict, norm_stats: dict, epoch: int,
         idw_k=8,
     )
 
-    # --- Decoder ---
+    # --- Decoder (both heads run on all query slots) ---
     n_qv = t2["n_query_vol"]
+    n_q_total = query_pos.shape[1]
+    n_qs = n_q_total - n_qv
+    decoder = model.module.decoder if hasattr(model, "module") else model.decoder
     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-        pred_vol, pred_surf = model.module.decoder(
+        pred_vol, pred_surf = decoder(
             enc_feat, vit_feat,
             query_pos,
             query_sdf.to(torch.bfloat16),
             query_sdf_grad.to(torch.bfloat16),
             idw_idx.unsqueeze(0),
             idw_w.unsqueeze(0).to(torch.bfloat16),
-            n_query_vol=n_qv,
-        ) if hasattr(model, "module") else model.decoder(
-            enc_feat, vit_feat,
-            query_pos,
-            query_sdf.to(torch.bfloat16),
-            query_sdf_grad.to(torch.bfloat16),
-            idw_idx.unsqueeze(0),
-            idw_w.unsqueeze(0).to(torch.bfloat16),
-            n_query_vol=n_qv,
         )
 
     # --- Z-score MSE (same as training loss) ---
+    # Volume targets correspond to query slots [0, n_qv);
+    # surface targets correspond to slots [n_qv, n_qv + n_qs).
     target_vol = t2["target_vol"].to(device).float()
     target_surf = t2["target_surf"].to(device).float()
 
-    mse_vol = F.mse_loss(pred_vol.squeeze(0).float(), target_vol).item()
-    mse_surf = F.mse_loss(pred_surf.squeeze(0).float(), target_surf).item()
+    pred_vol_eff = pred_vol.squeeze(0)[:n_qv].float()
+    pred_surf_eff = pred_surf.squeeze(0)[n_qv:n_qv + n_qs].float()
+
+    mse_vol = F.mse_loss(pred_vol_eff, target_vol).item()
+    mse_surf = F.mse_loss(pred_surf_eff, target_surf).item()
     total_mse = mse_vol + mse_surf
 
     return {"vol_mse": mse_vol, "surf_mse": mse_surf, "total_mse": total_mse}

@@ -91,6 +91,40 @@ def _build_optimizer_and_scheduler(
     return opt, sched
 
 
+def _masked_mse_losses(pred_vol: torch.Tensor,
+                       pred_surf: torch.Tensor,
+                       target_vol: torch.Tensor,
+                       target_surf: torch.Tensor,
+                       query_is_surf: torch.Tensor,
+                       query_valid_mask: torch.Tensor,
+                       ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mask-weighted per-channel MSE.
+
+    Each of the [B, N_q] query slots is one of: vol (valid & ~is_surf),
+    surf (valid & is_surf), or padding (~valid).  Vol head is supervised
+    on vol slots, surf head on surf slots; padding contributes to neither.
+
+    Returns ``(loss_vol, loss_surf)``; each is a scalar with the same
+    semantics as ``F.mse_loss(pred, target, reduction='mean')`` restricted
+    to the slots that head supervises.
+    """
+    is_surf = query_is_surf.bool()
+    valid = query_valid_mask.bool()
+    vol_mask = (valid & ~is_surf).to(pred_vol.dtype).unsqueeze(-1)    # (B, N_q, 1)
+    surf_mask = (valid & is_surf).to(pred_surf.dtype).unsqueeze(-1)   # (B, N_q, 1)
+
+    vol_count = vol_mask.sum().clamp(min=1.0)
+    surf_count = surf_mask.sum().clamp(min=1.0)
+    c_vol = pred_vol.shape[-1]
+    c_surf = pred_surf.shape[-1]
+
+    err_vol = (pred_vol - target_vol.to(pred_vol.dtype)) ** 2
+    err_surf = (pred_surf - target_surf.to(pred_surf.dtype)) ** 2
+    loss_vol = (err_vol * vol_mask).sum() / (vol_count * c_vol)
+    loss_surf = (err_surf * surf_mask).sum() / (surf_count * c_surf)
+    return loss_vol, loss_surf
+
+
 def _estimate_steps_per_epoch(cases_per_bin: dict[str, list]) -> int:
     total = 0
     for sb, cids in cases_per_bin.items():
@@ -125,7 +159,6 @@ def evaluate_split(
 
         L = item['L']
         R = 16
-        n_qv = item['n_query_vol']
 
         flex_mask = build_block_mask_direct(
             batch_cpu['bigbird_key_idx'], L=L, R=R, device=device)
@@ -156,12 +189,13 @@ def evaluate_split(
                 rope_cos=batch['rope_cos'],
                 rope_sin=batch['rope_sin'],
                 flex_mask=flex_mask,
-                n_query_vol=n_qv,
             )
-            total_vol += F.mse_loss(
-                pred_vol, batch['query_target_volume'][:, :n_qv]).item()
-            total_surf += F.mse_loss(
-                pred_surf, batch['query_target_surface']).item()
+            vol_l, surf_l = _masked_mse_losses(
+                pred_vol, pred_surf,
+                batch['query_target_volume'], batch['query_target_surface'],
+                batch['query_is_surf'], batch['query_valid_mask'])
+            total_vol += vol_l.item()
+            total_surf += surf_l.item()
             n_cases += 1
 
     if is_distributed():
@@ -393,8 +427,6 @@ def train(cfg: dict) -> None:
                 batch['query_leaf_id'],
                 idw_k=int(cfg['model'].get('decoder_idw_k', 8)))
 
-            n_qv = batch_cpu['n_query_vol']
-
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 pred_vol, pred_surf = compiled(
                     leaf_centroid_norm=batch['leaf_centroid_norm'],
@@ -413,13 +445,15 @@ def train(cfg: dict) -> None:
                     rope_cos=batch['rope_cos'],
                     rope_sin=batch['rope_sin'],
                     flex_mask=flex_mask,
-                    n_query_vol=n_qv,
                 )
 
-                loss_vol = F.mse_loss(
-                    pred_vol, batch['query_target_volume'][:, :n_qv])
-                loss_surf = F.mse_loss(
-                    pred_surf, batch['query_target_surface'])
+                loss_vol, loss_surf = _masked_mse_losses(
+                    pred_vol, pred_surf,
+                    batch['query_target_volume'],
+                    batch['query_target_surface'],
+                    batch['query_is_surf'],
+                    batch['query_valid_mask'],
+                )
                 loss = loss_vol + loss_surf
 
             loss.backward()

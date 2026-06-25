@@ -86,8 +86,10 @@ class HDB3DModel(nn.Module):
                 rope_cos: torch.Tensor,              # (B, L+R, 32)
                 rope_sin: torch.Tensor,              # (B, L+R, 32)
                 flex_mask,                           # BlockMask
-                n_query_vol: int,                    # split point
                 ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Both heads predict on every query slot (B, N_q, *).  The
+        caller is responsible for masking the loss by query_is_surf /
+        query_valid_mask — see training/loop.py."""
         leaf_aggr = build_leaf_aggregate(
             leaf_stats=leaf_stats,
             leaf_sdf=leaf_sdf,
@@ -103,7 +105,6 @@ class HDB3DModel(nn.Module):
             leaf_token, vit_feat,
             query_pos_norm, query_sdf, query_sdf_grad,
             idw_indices, idw_weights,
-            n_query_vol,
         )
         return pred_vol, pred_surf
 
@@ -144,9 +145,9 @@ class HDB3DModel(nn.Module):
                      query_pos_norm: torch.Tensor, query_sdf: torch.Tensor,
                      query_sdf_grad: torch.Tensor,
                      idw_indices: torch.Tensor, idw_weights: torch.Tensor,
-                     n_query_vol: int
                      ) -> tuple[torch.Tensor, torch.Tensor]:
-        """For test inference: decode a chunk of queries."""
+        """For test inference: decode a chunk of queries.  Both heads
+        run on all slots; the caller selects pred_vol or pred_surf based
+        on which kind of chunk was passed in."""
         return self.decoder(enc_feat, vit_feat, query_pos_norm, query_sdf,
-                            query_sdf_grad, idw_indices, idw_weights,
-                            n_query_vol)
+                            query_sdf_grad, idw_indices, idw_weights)

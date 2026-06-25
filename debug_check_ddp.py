@@ -180,7 +180,7 @@ def main():
 
     # ================================================================ PREFETCHER + 1 BATCH
     banner(rank, "Prefetcher: Build + Consume 1 Batch", 5)
-    from dataset.prefetcher import prepare_one_case, stack_batch, _trim_queries_to_nqv
+    from dataset.prefetcher import prepare_one_case, stack_batch
     from training.shard import build_grouped_shard, BATCH_SIZES, SUB_BIN_L
 
     pick_sb = list(cases_per_bin.keys())[0]
@@ -200,16 +200,16 @@ def main():
                                 encoder_k=32, n_query=n_query)
         items.append(item)
 
-    n_qv = min(it["n_query_vol"] for it in items)
-    for it in items:
-        _trim_queries_to_nqv(it, n_qv, it["n_query_vol"])
-
+    # Per-case query tensors are already shaped [n_query, *] (uniform);
+    # stack_batch is enough, no trim needed.
     batch_cpu = stack_batch(items)
-    batch_cpu["n_query_vol"] = n_qv
     batch_cpu["L"] = L
     dt = time.time() - t0
 
-    log(rank, f"  Batch built in {dt:.2f}s, n_query_vol={n_qv}")
+    n_qv_min = int(min(it["n_query_vol"] for it in items))
+    n_qs_min = int(min(it["n_query_surf"] for it in items))
+    log(rank, f"  Batch built in {dt:.2f}s, "
+              f"per-item n_query_vol min={n_qv_min}, n_query_surf min={n_qs_min}")
     for k, v in sorted(batch_cpu.items()):
         if isinstance(v, torch.Tensor) and rank == 0:
             print(f"    {_fmt(v, k)}", flush=True)
@@ -269,7 +269,6 @@ def main():
             rope_cos=batch["rope_cos"],
             rope_sin=batch["rope_sin"],
             flex_mask=flex_mask,
-            n_query_vol=n_qv,
         )
     torch.cuda.synchronize()
     dt = time.time() - t0
@@ -278,7 +277,7 @@ def main():
     log(rank, f"  {_fmt(pred_vol, 'pred_vol')}")
     log(rank, f"  {_fmt(pred_surf, 'pred_surf')}")
 
-    target_vol = batch["query_target_volume"][:, :n_qv]
+    target_vol = batch["query_target_volume"]
     target_surf = batch["query_target_surface"]
 
     if pred_vol.shape != target_vol.shape:
@@ -291,9 +290,12 @@ def main():
 
     # ================================================================ LOSS + BACKWARD
     banner(rank, "Loss + Backward + Gradient Sync", 8)
+    from training.loop import _masked_mse_losses
     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-        loss_vol = F.mse_loss(pred_vol, target_vol)
-        loss_surf = F.mse_loss(pred_surf, target_surf)
+        loss_vol, loss_surf = _masked_mse_losses(
+            pred_vol, pred_surf, target_vol, target_surf,
+            batch["query_is_surf"], batch["query_valid_mask"],
+        )
         loss = loss_vol + loss_surf
 
     log_all(rank, world, f"loss={loss.item():.6f} (vol={loss_vol.item():.6f} surf={loss_surf.item():.6f})")
@@ -384,15 +386,123 @@ def main():
             rope_cos=batch["rope_cos"],
             rope_sin=batch["rope_sin"],
             flex_mask=flex_mask,
-            n_query_vol=n_qv,
         )
     torch.cuda.synchronize()
     dt = time.time() - t0
     log(rank, f"  2nd forward: {dt:.2f}s (should be faster than 1st)")
     log(rank, "  PASS")
 
+    # ================================================================ MULTI-SUB-BIN + MULTI-STEP
+    banner(rank, "Multi-sub-bin + multi-step coverage", 11)
+    # The 1-batch test above only exercises ONE sub-bin and ONE step.
+    # Real training cycles through every sub-bin and runs hundreds of
+    # steps per epoch. Here we walk through up to MAX_STEPS additional
+    # batches drawn from a mix of sub-bins to catch:
+    #   - per-sub-bin compile cache flips (torch.compile recompiles
+    #     when L changes — should still complete, just slower for new L)
+    #   - GPU memory growth across steps (leak detection)
+    #   - DDP backward all-reduce on varying B
+    #
+    # We tear down the model's gradients between steps but reuse the
+    # same compiled model + optimizer so the cache stays warm.
+    MAX_STEPS = 6
+    # Order sub-bins so the first picks NEW L values (forces compile);
+    # later steps reuse them (should be cached).
+    sub_bins_to_try: list[str] = []
+    for sb in cases_per_bin.keys():
+        if sb != pick_sb and cases_per_bin[sb]:
+            sub_bins_to_try.append(sb)
+    sub_bins_to_try = sub_bins_to_try[:MAX_STEPS]
+
+    if not sub_bins_to_try:
+        log(rank, "  (only 1 sub-bin available this rank — skipping multi-step)")
+    else:
+        gpu_peak_per_step: list[float] = []
+        for step_idx, sb in enumerate(sub_bins_to_try):
+            ids_sb = cases_per_bin[sb][:BATCH_SIZES.get(sb, 1)]
+            if not ids_sb:
+                continue
+            L_sb = SUB_BIN_L[sb]
+            B_sb = len(ids_sb)
+            torch.cuda.reset_peak_memory_stats(device)
+
+            t_step = time.time()
+            items_sb = [
+                prepare_one_case(all_pt_data[c], case_id=i, epoch=0,
+                                 encoder_k=32, n_query=n_query)
+                for i, c in enumerate(ids_sb)
+            ]
+            for it in items_sb:
+                it["L"] = L_sb
+                it["sub_bin"] = sb
+
+            batch_cpu_sb = stack_batch(items_sb)
+            batch_cpu_sb["L"] = L_sb
+            flex_mask_sb = build_block_mask_direct(
+                batch_cpu_sb["bigbird_key_idx"], L=L_sb, R=R, device=device)
+            batch_sb = {k: (v.to(device, non_blocking=True)
+                            if isinstance(v, torch.Tensor) else v)
+                        for k, v in batch_cpu_sb.items()}
+            idw_idx_sb, idw_w_sb = gpu_idw(
+                batch_sb["query_pos_norm"], batch_sb["leaf_centroid_norm"],
+                batch_sb["latent_neighbor_top64"], batch_sb["query_leaf_id"],
+                idw_k=int(cfg["model"].get("decoder_idw_k", 8)))
+
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                pv, ps = compiled(
+                    leaf_centroid_norm=batch_sb["leaf_centroid_norm"],
+                    leaf_stats=batch_sb["leaf_stats"],
+                    leaf_sdf=batch_sb["leaf_sdf"],
+                    leaf_sdf_grad=batch_sb["leaf_sdf_grad"],
+                    leaf_curvature_mean=batch_sb["leaf_curvature_mean"],
+                    leaf_curvature_gauss=batch_sb["leaf_curvature_gauss"],
+                    leaf_pbd=batch_sb["leaf_pbd"],
+                    transient1=batch_sb["transient1"],
+                    query_pos_norm=batch_sb["query_pos_norm"],
+                    query_sdf=batch_sb["query_sdf"],
+                    query_sdf_grad=batch_sb["query_sdf_grad"],
+                    idw_indices=idw_idx_sb,
+                    idw_weights=idw_w_sb,
+                    rope_cos=batch_sb["rope_cos"],
+                    rope_sin=batch_sb["rope_sin"],
+                    flex_mask=flex_mask_sb,
+                )
+                l_v, l_s = _masked_mse_losses(
+                    pv, ps,
+                    batch_sb["query_target_volume"],
+                    batch_sb["query_target_surface"],
+                    batch_sb["query_is_surf"],
+                    batch_sb["query_valid_mask"],
+                )
+                loss_sb = l_v + l_s
+
+            loss_sb.backward()
+            opt.zero_grad(set_to_none=True)
+            torch.cuda.synchronize()
+
+            peak_step = torch.cuda.max_memory_allocated(device) / 1e9
+            gpu_peak_per_step.append(peak_step)
+            log(rank, f"  step {step_idx + 1}: sub_bin={sb} L={L_sb} B={B_sb} "
+                      f"loss={loss_sb.item():.4e} "
+                      f"peak={peak_step:.1f}GB "
+                      f"t={time.time() - t_step:.1f}s")
+
+        # Growth across steps: peak should plateau after a couple of
+        # compile flips, NOT grow linearly with step index.
+        if len(gpu_peak_per_step) >= 3:
+            first_half = sum(gpu_peak_per_step[:len(gpu_peak_per_step) // 2])
+            second_half = sum(gpu_peak_per_step[len(gpu_peak_per_step) // 2:])
+            ratio = second_half / max(first_half, 1e-9)
+            if ratio > 1.5:
+                log(rank, f"  WARN: GPU peak grew {ratio:.2f}x from first "
+                          f"half to second half — possible leak")
+            else:
+                log(rank, f"  GPU peak stable across steps "
+                          f"(ratio={ratio:.2f})")
+        log(rank, "  PASS")
+
     # ================================================================ MEMORY
-    banner(rank, "Memory Summary", 11)
+    banner(rank, "Memory Summary", 12)
     peak = torch.cuda.max_memory_allocated(device) / 1e9
     reserved = torch.cuda.memory_reserved(device) / 1e9
     log_all(rank, world, f"GPU peak={peak:.2f}GB reserved={reserved:.2f}GB")
@@ -409,9 +519,11 @@ def main():
     # ================================================================ SUMMARY
     if rank == 0:
         print(f"\n{'='*70}", flush=True)
-        print(f"  ALL 11 STEPS PASSED on {world} GPUs", flush=True)
-        print(f"  DDP + compile + forward + backward + sync all working.", flush=True)
-        print(f"  Full training with torchrun --nproc_per_node={world} should work.", flush=True)
+        print(f"  ALL 12 STEPS PASSED on {world} GPUs", flush=True)
+        print(f"  DDP + compile + forward + backward + sync + multi-sub-bin "
+              f"all working.", flush=True)
+        print(f"  Full training with torchrun --nproc_per_node={world} "
+              f"should work.", flush=True)
         print(f"{'='*70}", flush=True)
 
     if is_distributed():

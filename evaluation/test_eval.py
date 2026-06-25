@@ -139,13 +139,9 @@ def _decode_chunk(model, enc_feat: torch.Tensor, vit_feat: torch.Tensor,
         point_pos_norm, leaf_centroid_norm, neighbor_top64,
         point_leaf_id, idw_k=idw_k)
 
-    # n_query_vol: if volume chunk, all queries are volume; if surface, all surface
-    n_chunk = hi - lo
-    if is_volume:
-        n_qv = n_chunk
-    else:
-        n_qv = 0
-
+    # Decoder now runs BOTH heads on every query slot.  For test
+    # inference we pass an entire chunk that is either all-volume or
+    # all-surface, then pick the matching head's output.
     raw_model = _get_model(model)
     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
         pred_vol, pred_surf = raw_model.decoder(
@@ -155,7 +151,6 @@ def _decode_chunk(model, enc_feat: torch.Tensor, vit_feat: torch.Tensor,
             point_sdf_grad.unsqueeze(0).to(torch.bfloat16),
             idw_idx.unsqueeze(0),
             idw_w.unsqueeze(0).to(torch.bfloat16),
-            n_query_vol=n_qv,
         )
 
     if is_volume:
