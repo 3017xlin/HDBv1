@@ -70,6 +70,16 @@ def _build_optimizer_and_scheduler(
     model: torch.nn.Module, cfg: dict, world: int,
     steps_per_epoch_est: int,
 ) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR]:
+    """Build AdamW + warmup-cosine LambdaLR.
+
+    The optimizer is initialised at ``base_lr * sqrt(world * B_ref)``
+    (B_ref = 4 per the DrivAerML default); the schedule then anneals
+    that.  Because we use variable per-sub-bin batch sizes (1 / 2 / 4),
+    the training step additionally multiplies the schedule's LR by
+    ``sqrt(B_current / B_ref)`` so each step uses an LR proportional to
+    ``sqrt(effective_batch)`` — the standard adaptive-optimiser scaling
+    rule.  See the call site in :func:`train` for the per-step mutation.
+    """
     base_lr = float(cfg['training']['lr'])
     wd = float(cfg['training']['weight_decay'])
     effective_lr = base_lr * math.sqrt(world * 4)
@@ -89,6 +99,40 @@ def _build_optimizer_and_scheduler(
 
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
     return opt, sched
+
+
+def _masked_mse_losses(pred_vol: torch.Tensor,
+                       pred_surf: torch.Tensor,
+                       target_vol: torch.Tensor,
+                       target_surf: torch.Tensor,
+                       query_is_surf: torch.Tensor,
+                       query_valid_mask: torch.Tensor,
+                       ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mask-weighted per-channel MSE.
+
+    Each of the [B, N_q] query slots is one of: vol (valid & ~is_surf),
+    surf (valid & is_surf), or padding (~valid).  Vol head is supervised
+    on vol slots, surf head on surf slots; padding contributes to neither.
+
+    Returns ``(loss_vol, loss_surf)``; each is a scalar with the same
+    semantics as ``F.mse_loss(pred, target, reduction='mean')`` restricted
+    to the slots that head supervises.
+    """
+    is_surf = query_is_surf.bool()
+    valid = query_valid_mask.bool()
+    vol_mask = (valid & ~is_surf).to(pred_vol.dtype).unsqueeze(-1)    # (B, N_q, 1)
+    surf_mask = (valid & is_surf).to(pred_surf.dtype).unsqueeze(-1)   # (B, N_q, 1)
+
+    vol_count = vol_mask.sum().clamp(min=1.0)
+    surf_count = surf_mask.sum().clamp(min=1.0)
+    c_vol = pred_vol.shape[-1]
+    c_surf = pred_surf.shape[-1]
+
+    err_vol = (pred_vol - target_vol.to(pred_vol.dtype)) ** 2
+    err_surf = (pred_surf - target_surf.to(pred_surf.dtype)) ** 2
+    loss_vol = (err_vol * vol_mask).sum() / (vol_count * c_vol)
+    loss_surf = (err_surf * surf_mask).sum() / (surf_count * c_surf)
+    return loss_vol, loss_surf
 
 
 def _estimate_steps_per_epoch(cases_per_bin: dict[str, list]) -> int:
@@ -125,7 +169,6 @@ def evaluate_split(
 
         L = item['L']
         R = 16
-        n_qv = item['n_query_vol']
 
         flex_mask = build_block_mask_direct(
             batch_cpu['bigbird_key_idx'], L=L, R=R, device=device)
@@ -156,12 +199,13 @@ def evaluate_split(
                 rope_cos=batch['rope_cos'],
                 rope_sin=batch['rope_sin'],
                 flex_mask=flex_mask,
-                n_query_vol=n_qv,
             )
-            total_vol += F.mse_loss(
-                pred_vol, batch['query_target_volume'][:, :n_qv]).item()
-            total_surf += F.mse_loss(
-                pred_surf, batch['query_target_surface']).item()
+            vol_l, surf_l = _masked_mse_losses(
+                pred_vol, pred_surf,
+                batch['query_target_volume'], batch['query_target_surface'],
+                batch['query_is_surf'], batch['query_valid_mask'])
+            total_vol += vol_l.item()
+            total_surf += surf_l.item()
             n_cases += 1
 
     if is_distributed():
@@ -270,7 +314,13 @@ def train(cfg: dict) -> None:
                     print(f'  {sb}: {len(cases_per_bin[sb])} (this rank)',
                           flush=True)
 
-    val_ids = manifest['splits']['val']
+    val_entries = manifest['splits']['val']
+    val_ids: list[str] = []
+    for entry in val_entries:
+        if isinstance(entry, dict):
+            val_ids.append(entry['case_name'])
+        else:
+            val_ids.append(str(entry))
     my_val_ids = sorted(val_ids[rank::world])
     if rank == 0:
         print(f'[data] loading {len(my_val_ids)} val cases ...', flush=True)
@@ -371,6 +421,8 @@ def train(cfg: dict) -> None:
 
         epoch_loss_vol = 0.0
         epoch_loss_surf = 0.0
+        epoch_lr_sum = 0.0           # sum of actual per-step LR (after sqrt-B scaling)
+        epoch_lr_n = 0
         n_steps = 0
         t_epoch = time.time()
 
@@ -386,8 +438,6 @@ def train(cfg: dict) -> None:
                 batch['latent_neighbor_top64'],
                 batch['query_leaf_id'],
                 idw_k=int(cfg['model'].get('decoder_idw_k', 8)))
-
-            n_qv = batch_cpu['n_query_vol']
 
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 pred_vol, pred_surf = compiled(
@@ -407,19 +457,39 @@ def train(cfg: dict) -> None:
                     rope_cos=batch['rope_cos'],
                     rope_sin=batch['rope_sin'],
                     flex_mask=flex_mask,
-                    n_query_vol=n_qv,
                 )
 
-                loss_vol = F.mse_loss(
-                    pred_vol, batch['query_target_volume'][:, :n_qv])
-                loss_surf = F.mse_loss(
-                    pred_surf, batch['query_target_surface'])
+                loss_vol, loss_surf = _masked_mse_losses(
+                    pred_vol, pred_surf,
+                    batch['query_target_volume'],
+                    batch['query_target_surface'],
+                    batch['query_is_surf'],
+                    batch['query_valid_mask'],
+                )
                 loss = loss_vol + loss_surf
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(),
                 float(cfg['training'].get('max_grad_norm', 1.0)))
+
+            # Per-step LR scaling by sqrt(B_current / B_ref).  The
+            # scheduler set opt.param_groups[0]['lr'] to its idealised
+            # value for an effective batch of world * 4 (= B_ref); the
+            # current batch has B = BATCH_SIZES[sub_bin], so its
+            # optimal LR is the scheduler's value × sqrt(B / 4).
+            # LambdaLR computes the next sched LR from its stored
+            # base_lrs (not from pg['lr']), so this mutation is local
+            # to this step.
+            B_current = BATCH_SIZES.get(
+                batch_cpu.get('sub_bin'), 1)
+            sched_lr = float(opt.param_groups[0]['lr'])
+            b_ratio = math.sqrt(B_current / 4.0)
+            for pg in opt.param_groups:
+                pg['lr'] = sched_lr * b_ratio
+            epoch_lr_sum += sched_lr * b_ratio
+            epoch_lr_n += 1
+
             opt.step()
             opt.zero_grad(set_to_none=True)
             sched.step()
@@ -449,13 +519,15 @@ def train(cfg: dict) -> None:
         # ====================================================== LOG
         if rank == 0:
             avg_total = avg_vol + avg_surf
+            avg_lr_eff = epoch_lr_sum / max(epoch_lr_n, 1)  # actual per-step LR avg
+            sched_lr = sched.get_last_lr()[0]
             if is_phase2:
                 print(
                     f'[epoch {epoch:03d} P2] '
                     f'loss={avg_total:.5f} (vol={avg_vol:.5f} surf={avg_surf:.5f}) '
                     f'val={val_metrics["total_mse"]:.5f} '
                     f'(v={val_metrics["vol_mse"]:.5f} s={val_metrics["surf_mse"]:.5f}) '
-                    f'lr={sched.get_last_lr()[0]:.3e} '
+                    f'lr_sched={sched_lr:.3e} lr_eff={avg_lr_eff:.3e} '
                     f'steps={n_steps} '
                     f'gpu={gpu_peak_gib(local):.1f}GiB '
                     f'cpu={cpu_rss_gib():.1f}GiB '
@@ -467,7 +539,8 @@ def train(cfg: dict) -> None:
                 print(
                     f'[epoch {epoch:03d} P1] '
                     f'loss={avg_total:.5f} (vol={avg_vol:.5f} surf={avg_surf:.5f}) '
-                    f'lr={sched.get_last_lr()[0]:.3e} T={T_curr:.2f} '
+                    f'lr_sched={sched_lr:.3e} lr_eff={avg_lr_eff:.3e} '
+                    f'T={T_curr:.2f} '
                     f'steps={n_steps} '
                     f'gpu={gpu_peak_gib(local):.1f}GiB '
                     f't={time.time() - t_epoch:.1f}s',

@@ -96,7 +96,7 @@ def main():
     device = torch.device("cuda", 0)
     torch.cuda.set_device(device)
     print(f"  GPU: {torch.cuda.get_device_name(0)}")
-    print(f"  Memory: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
+    print(f"  Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     print(f"  CUDA version: {torch.version.cuda}")
     print(f"  PyTorch version: {torch.__version__}")
     print(f"  PASS")
@@ -118,6 +118,19 @@ def main():
                              ("decoder", model.decoder)]:
             n = sum(p.numel() for p in module.parameters())
             print(f"    {name:12s}: {n:>12,} params")
+
+        # torch.compile is required so FlexAttention uses the Triton
+        # sparse kernel; without compile it falls back to sdpa_dense,
+        # which materialises a full (B,H,T,T) score matrix and OOMs at
+        # L=32k+.
+        compile_mode = cfg.get("training", {}).get(
+            "compile_mode", "reduce-overhead")
+        try:
+            model = torch.compile(model, mode=compile_mode, fullgraph=False)
+            print(f"  torch.compile(mode='{compile_mode}') wrapped")
+        except Exception as ce:
+            print(f"  WARN: torch.compile failed ({ce}); falling back to eager "
+                  f"(forward will likely OOM on big-L cases)")
 
         print(f"  PASS")
     except Exception as e:
@@ -216,9 +229,10 @@ def main():
         batch_cpu = stack_batch([item])
         print(f"\n  stack_batch (B=1) done. Batch keys: {len(batch_cpu)}")
         n_qv = item["n_query_vol"]
-        batch_cpu["n_query_vol"] = n_qv
+        n_qs = item["n_query_surf"]
         batch_cpu["L"] = L
-        print(f"  n_query_vol = {n_qv}")
+        print(f"  n_query_vol = {n_qv}  n_query_surf = {n_qs}  "
+              f"(both heads run on all {item['query_pos_norm'].shape[0]} slots)")
         print(f"  PASS")
     except Exception as e:
         print(f"  FAIL: {e}")
@@ -316,7 +330,6 @@ def main():
                 rope_cos=batch["rope_cos"],
                 rope_sin=batch["rope_sin"],
                 flex_mask=flex_mask,
-                n_query_vol=n_qv,
             )
         torch.cuda.synchronize()
         dt = time.time() - t0
@@ -325,10 +338,14 @@ def main():
         print(f"    {_fmt_tensor(pred_vol, 'pred_vol')}")
         print(f"    {_fmt_tensor(pred_surf, 'pred_surf')}")
 
-        target_vol = batch["query_target_volume"][:, :n_qv]
+        target_vol = batch["query_target_volume"]
         target_surf = batch["query_target_surface"]
+        is_surf_mask = batch["query_is_surf"]
+        valid_mask = batch["query_valid_mask"]
         print(f"    {_fmt_tensor(target_vol, 'target_vol')}")
         print(f"    {_fmt_tensor(target_surf, 'target_surf')}")
+        print(f"    {_fmt_tensor(is_surf_mask, 'query_is_surf')}")
+        print(f"    {_fmt_tensor(valid_mask, 'query_valid_mask')}")
 
         if pred_vol.shape != target_vol.shape:
             print(f"  FAIL: pred_vol shape {pred_vol.shape} != target {target_vol.shape}")
@@ -346,10 +363,12 @@ def main():
     # ================================================================ LOSS
     banner("STEP 10: Loss Computation")
     try:
-        import torch.nn.functional as F
+        from training.loop import _masked_mse_losses
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            loss_vol = F.mse_loss(pred_vol, target_vol)
-            loss_surf = F.mse_loss(pred_surf, target_surf)
+            loss_vol, loss_surf = _masked_mse_losses(
+                pred_vol, pred_surf, target_vol, target_surf,
+                is_surf_mask, valid_mask,
+            )
             loss = loss_vol + loss_surf
 
         print(f"  loss_vol  = {loss_vol.item():.6f}")

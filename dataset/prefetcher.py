@@ -81,25 +81,11 @@ def build_bigbird_index_fast(bigbird_fixed: torch.Tensor | np.ndarray,
     return np.concatenate([fixed_np, random_keys], axis=1)
 
 
-def _trim_queries_to_nqv(item: dict[str, Any], target_nqv: int,
-                          actual_nqv: int) -> None:
-    """In-place trim volume queries from actual_nqv down to target_nqv.
-
-    Query tensors are laid out as [vol_queries | surf_queries]. We keep
-    the first ``target_nqv`` volume rows and all surface rows intact.
-    """
-    if actual_nqv == target_nqv:
-        return
-
-    for key in ('query_pos_norm', 'query_sdf', 'query_sdf_grad',
-                'query_leaf_id'):
-        t = item[key]
-        vol_part = t[:target_nqv]
-        surf_part = t[actual_nqv:]
-        item[key] = torch.cat([vol_part, surf_part], dim=0)
-
-    item['query_target_volume'] = item['query_target_volume'][:target_nqv]
-    item['n_query_vol'] = target_nqv
+# (Removed _trim_queries_to_nqv: build_transient2 now returns full
+#  [n_query, ...] arrays padded to a fixed length, with `query_is_surf`
+#  and `query_valid_mask` distinguishing vol / surf / padding.  No per-
+#  batch trimming is needed — every per-case tensor already has shape
+#  [n_query, *] and stacks cleanly into [B, n_query, *].)
 
 
 def prepare_one_case(case_pt: dict[str, Any], case_id: int, epoch: int,
@@ -140,10 +126,13 @@ def prepare_one_case(case_pt: dict[str, Any], case_id: int, epoch: int,
             t2['query_target_volume']).to(torch.bfloat16),
         'query_target_surface': torch.from_numpy(
             t2['query_target_surface']).to(torch.bfloat16),
+        'query_is_surf': torch.from_numpy(t2['query_is_surf']),       # (n_query,) bool
+        'query_valid_mask': torch.from_numpy(t2['query_valid_mask']),  # (n_query,) bool
         'bigbird_key_idx': torch.from_numpy(key_idx),
         'rope_cos': _ensure_tensor(case_pt['rope_cos']),
         'rope_sin': _ensure_tensor(case_pt['rope_sin']),
         'n_query_vol': int(t2['n_query_vol']),
+        'n_query_surf': int(t2['n_query_surf']),
         'L': L,
     }
     return out
@@ -209,15 +198,14 @@ class AsyncPrefetcher:
                 else:
                     items = [self._build_one(batch_case_ids[0])]
 
-                batch_n_qv = min(item['n_query_vol'] for item in items)
+                # All per-case query tensors are already shaped
+                # [n_query, *] (see training/transient.py build_transient2),
+                # so stacking is just torch.stack — no per-batch trim.
                 for item in items:
-                    _trim_queries_to_nqv(
-                        item, batch_n_qv, item['n_query_vol'])
                     item['L'] = L
                     item['sub_bin'] = sub_bin
 
                 batch = stack_batch(items)
-                batch['n_query_vol'] = batch_n_qv
                 batch['L'] = L
                 batch['sub_bin'] = sub_bin
 

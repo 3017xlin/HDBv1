@@ -6,7 +6,12 @@ import numpy as np
 import torch
 
 
-def per_case_epoch_seed(case_id: int, epoch: int) -> int:
+def per_case_epoch_seed(case_id, epoch: int) -> int:
+    """Deterministic 32-bit seed from (case_id, epoch).
+
+    ``case_id`` can be either an int (legacy index) or a str (case_name,
+    current convention); the function stringifies and hashes either way.
+    """
     h = hashlib.blake2b(f'{case_id}:{epoch}'.encode(), digest_size=4)
     return int(h.hexdigest(), 16)
 
